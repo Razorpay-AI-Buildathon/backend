@@ -1,0 +1,72 @@
+import os
+import logging
+import redis
+from typing import Optional
+
+logger = logging.getLogger("recoverai.cache")
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+class RedisCache:
+    _client = None
+
+    @classmethod
+    def get_client(cls):
+        if cls._client is None:
+            try:
+                cls._client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2.0)
+                cls._client.ping()
+                logger.info(f"Connected to Redis at {REDIS_URL}")
+            except Exception as e:
+                logger.warning(f"Failed to connect to Redis at {REDIS_URL}: {e}. Caching is disabled.")
+                cls._client = False
+        return cls._client
+
+    @classmethod
+    def get(cls, key: str) -> Optional[str]:
+        client = cls.get_client()
+        if not client:
+            return None
+        try:
+            return client.get(key)
+        except Exception as e:
+            logger.error(f"Redis GET failed for key {key}: {e}")
+            return None
+
+    @classmethod
+    def set(cls, key: str, value: str, expire_seconds: int = 300) -> bool:
+        client = cls.get_client()
+        if not client:
+            return False
+        try:
+            client.set(key, value, ex=expire_seconds)
+            return True
+        except Exception as e:
+            logger.error(f"Redis SET failed for key {key}: {e}")
+            return False
+
+    @classmethod
+    def delete(cls, key: str) -> bool:
+        client = cls.get_client()
+        if not client:
+            return False
+        try:
+            client.delete(key)
+            return True
+        except Exception as e:
+            logger.error(f"Redis DELETE failed for key {key}: {e}")
+            return False
+
+    @classmethod
+    def clear_cache_pattern(cls, pattern: str) -> bool:
+        client = cls.get_client()
+        if not client:
+            return False
+        try:
+            keys = client.keys(pattern)
+            if keys:
+                client.delete(*keys)
+            return True
+        except Exception as e:
+            logger.error(f"Redis clear pattern {pattern} failed: {e}")
+            return False
