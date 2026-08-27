@@ -121,6 +121,16 @@ class RecoveryWorker:
                     target_state = CaseStatus.RECOVERED if res["recovered"] else CaseStatus.FAILED
                     CaseStateMachine.transition_status(db, case, target_state, "worker_execution_result", "SYSTEM", {"execution_id": res["execution_id"]})
 
+                    from app.services.logging import logger as struct_logger
+                    struct_logger.info(
+                        "Action execution completed",
+                        case_id=case.id,
+                        event_id=event.id,
+                        action_id=action_id,
+                        execution_id=res["execution_id"],
+                        status=target_state.value
+                    )
+
                     if target_state == CaseStatus.FAILED:
                         case.current_recovery_attempt += 1
                         if case.current_recovery_attempt >= case.max_attempts:
@@ -137,6 +147,15 @@ class RecoveryWorker:
                 else:
                     CaseStateMachine.transition_status(db, case, CaseStatus.BLOCKED, "worker_guard_blocked", "SYSTEM", {"violations": violations})
                     db.commit()
+
+                    from app.services.logging import logger as struct_logger
+                    struct_logger.info(
+                        "Action execution blocked by guard",
+                        case_id=case.id,
+                        event_id=event.id,
+                        action_id=action_id,
+                        violations=violations
+                    )
             except Exception as e:
                 print(f"RecoveryWorker: Error calling AI Service/ActionGuard: {e}")
         except Exception as e:
