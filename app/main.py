@@ -29,3 +29,36 @@ app.add_middleware(
 
 # Include main router
 app.include_router(api_router)
+
+
+def start_redis_background_services():
+    import threading
+    import time
+    from app.services.queue import RedisQueue, RedisScheduler
+    from app.services.worker import RecoveryWorker
+
+    # 1. Start RecoveryWorker dequeue consumer thread
+    def run_worker():
+        worker = RecoveryWorker()
+        worker.run()
+
+    # 2. Start RedisScheduler polling thread
+    def run_scheduler():
+        scheduler = RedisScheduler()
+        queue = RedisQueue()
+        while True:
+            try:
+                due_tasks = scheduler.poll_due_tasks()
+                for task in due_tasks:
+                    queue.enqueue(task["task_name"], task["payload"])
+            except Exception as e:
+                print(f"RedisScheduler: Error polling due tasks: {e}")
+            time.sleep(2)  # Check scheduled tasks every 2 seconds
+
+    threading.Thread(target=run_worker, daemon=True).start()
+    threading.Thread(target=run_scheduler, daemon=True).start()
+
+
+@app.on_event("startup")
+def startup_event():
+    start_redis_background_services()

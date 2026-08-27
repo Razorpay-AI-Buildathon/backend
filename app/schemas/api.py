@@ -171,6 +171,7 @@ class CaseDetail(BaseModel):
     audit_log: List[Any]
     created_at: datetime
     actions: List[Dict[str, Any]] = []
+    audit_events: Optional[List[Dict[str, Any]]] = []
 
     class Config:
         from_attributes = True
@@ -186,3 +187,9 @@ class MetricsResponse(BaseModel):
     human_escalation_rate: float
     backend_action_agreement: Optional[float] = None
     council_action_agreement: Optional[float] = None
+
+
+class HumanReviewRequest(BaseModel):
+    action: str
+    operator_id: str
+    notes: Optional[str] = None

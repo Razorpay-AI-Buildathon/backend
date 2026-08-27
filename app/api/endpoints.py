@@ -6,7 +6,7 @@ import json
 import uuid
 import secrets
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from app.db.session import get_db
 from app.models.case import (
@@ -17,7 +17,11 @@ from app.models.case import (
     ActionType,
     ActionState,
     CaseStateMachine,
+    Merchant,
+    Customer,
+    Execution,
 )
+from app.schemas.event import PaymentEventIngest, PaymentEventIngestResponse
 from app.schemas.api import (
     ScoreRequest,
     ScoreResponse,
@@ -30,6 +34,7 @@ from app.schemas.api import (
     CaseDetail,
     MetricsResponse,
     ActionTypeEnum,
+    HumanReviewRequest,
 )
 from app.services.scoring import (
     calculate_erv,
@@ -87,6 +92,145 @@ def redact_secrets(val: Any) -> Any:
 def get_health():
     # Public Endpoint
     return {"status": "ok", "service": "recoverai-backend"}
+
+
+@router.post("/api/events/payment", response_model=PaymentEventIngestResponse, dependencies=[Depends(verify_api_key)])
+def ingest_payment_event(payload: PaymentEventIngest, db: Session = Depends(get_db)):
+    # 1. Enforce event idempotency: check if event_id already exists
+    existing_event = db.query(PaymentEvent).filter(PaymentEvent.id == payload.event_id).first()
+    if not existing_event and payload.provider_event_id:
+        # Check in metadata for duplicate provider reference
+        existing_event = db.query(PaymentEvent).filter(
+            PaymentEvent.payload_metadata["provider_event_id"].as_string() == payload.provider_event_id
+        ).first()
+
+    if existing_event:
+        case = db.query(RecoveryCase).filter(RecoveryCase.event_id == existing_event.id).first()
+        case_id = case.id if case else ""
+        return PaymentEventIngestResponse(
+            status="success",
+            message="Event already processed (idempotent)",
+            event_id=existing_event.id,
+            case_id=case_id
+        )
+
+    # 2. Ensure Merchant exists
+    merchant = db.query(Merchant).filter(Merchant.id == payload.merchant_id).first()
+    if not merchant:
+        merchant = Merchant(
+            id=payload.merchant_id,
+            name=f"Merchant {payload.merchant_id}",
+            amount_threshold=5000.00,
+            max_retries=3
+        )
+        db.add(merchant)
+        db.flush()
+
+    # 3. Ensure Customer exists
+    customer_email = payload.metadata.get("customer_email", f"cust-{payload.customer_id}@example.com")
+    customer = db.query(Customer).filter(Customer.id == payload.customer_id).first()
+    if not customer:
+        customer = Customer(
+            id=payload.customer_id,
+            merchant_id=merchant.id,
+            email=customer_email,
+            risk_score=0.15,
+            payment_history_success_rate=0.90
+        )
+        db.add(customer)
+        db.flush()
+
+    # 4. Persist PaymentEvent
+    event = PaymentEvent(
+        id=payload.event_id,
+        merchant_id=merchant.id,
+        customer_id=customer.id,
+        event_type=payload.event_type,
+        amount=payload.amount,
+        currency=payload.currency,
+        failure_code=payload.failure_code,
+        provider=payload.provider,
+        provider_event_id=payload.provider_event_id,
+        payload_metadata={
+            "provider": payload.provider,
+            "provider_event_id": payload.provider_event_id,
+            **(payload.metadata or {})
+        },
+        timestamp=datetime.utcnow()
+    )
+    db.add(event)
+    db.flush()
+
+    # 5. Instantiate RecoveryCase
+    erv = calculate_erv(
+        amount=payload.amount,
+        currency=payload.currency,
+        failure_code=payload.failure_code,
+        history_success_rate=float(customer.payment_history_success_rate),
+        attempt=0
+    )
+    priority = calculate_priority_score(
+        amount=payload.amount,
+        currency=payload.currency,
+        failure_code=payload.failure_code,
+        history_success_rate=float(customer.payment_history_success_rate),
+        attempt=0
+    )
+
+    case_id = f"case-{uuid.uuid4().hex[:12]}"
+    case = RecoveryCase(
+        id=case_id,
+        event_id=event.id,
+        merchant_id=merchant.id,
+        customer_id=customer.id,
+        status=CaseStatus.IDENTIFIED,
+        priority_score=priority,
+        expected_recovery_value=erv,
+        current_recovery_attempt=0,
+        audit_log=[
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "node": "ingestion",
+                "event": "event_received",
+                "inputs": {"event_type": event.event_type, "amount": float(payload.amount)},
+                "outputs": {"status": "success"},
+                "decision": "IDENTIFIED",
+                "confidence": 1.0,
+                "decision_source": "SYSTEM",
+                "model": "rule_engine"
+            }
+        ],
+        created_at=datetime.utcnow()
+    )
+    db.add(case)
+    from app.models.case import AuditEvent
+    audit_evt = AuditEvent(
+        case_id=case.id,
+        event_type="CASE_CREATED",
+        actor="SYSTEM",
+        decision_source="SYSTEM",
+        metadata_json={"event_type": event.event_type, "amount": float(payload.amount)},
+        timestamp=datetime.utcnow()
+    )
+    db.add(audit_evt)
+    db.commit()
+
+    # Trigger background evaluation worker queue immediately
+    from app.services.queue import RedisQueue
+    try:
+        RedisQueue().enqueue("evaluate_case", {"case_id": case.id})
+    except Exception as e:
+        print(f"Ingestion Queue Warning: Failed to enqueue evaluate_case: {e}")
+
+    # Invalidate metrics cache
+    RedisCache.delete("metrics_data")
+
+    return PaymentEventIngestResponse(
+        status="success",
+        message="Event ingested successfully",
+        event_id=event.id,
+        case_id=case.id
+    )
 
 
 @router.get("/api/metrics", response_model=MetricsResponse, dependencies=[Depends(verify_api_key)])
@@ -282,6 +426,22 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
     # Redact sensitive parameters recursively inside audit log outputs before response dispatches
     redacted_logs = redact_secrets(c.audit_log or [])
 
+    audit_events_list = [
+        {
+            "id": evt.id,
+            "case_id": evt.case_id,
+            "action_id": evt.action_id,
+            "event_type": evt.event_type,
+            "actor": evt.actor,
+            "decision_source": evt.decision_source,
+            "timestamp": evt.timestamp.isoformat(),
+            "metadata_json": redact_secrets(evt.metadata_json or {}),
+        }
+        for evt in c.audit_events
+    ]
+    # Sort chronologically by timestamp
+    audit_events_list.sort(key=lambda x: x["timestamp"])
+
     return CaseDetail(
         case_id=c.id,
         event_id=c.event_id,
@@ -296,6 +456,7 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
         audit_log=redacted_logs,
         created_at=c.created_at,
         actions=actions_list,
+        audit_events=audit_events_list,
     )
 
 
@@ -369,11 +530,10 @@ def evaluate_guard(req: ActionGuardRequest, db: Session = Depends(get_db)):
     c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
     if c:
         # Enforce transition rules
-        if not CaseStateMachine.validate_transition(c.status, CaseStatus.GUARD_REVIEW):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Illegal transition: {c.status} -> GUARD_REVIEW",
-            )
+        try:
+            CaseStateMachine.transition_status(db, c, CaseStatus.GUARD_REVIEW, "evaluate_guard", "SYSTEM")
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
 
     approved, token, violations = ActionGuard.validate_action(
         action_type=req.action_type.value,
@@ -394,6 +554,18 @@ def evaluate_guard(req: ActionGuardRequest, db: Session = Depends(get_db)):
     res_status = "APPROVED" if approved else "REJECTED"
     if req.action_type == ActionTypeEnum.ESCALATE_TO_HUMAN:
         res_status = "HUMAN_REVIEW"
+
+    # Apply next transition based on outcome
+    if c:
+        try:
+            if req.action_type == ActionTypeEnum.ESCALATE_TO_HUMAN:
+                CaseStateMachine.transition_status(db, c, CaseStatus.HUMAN_REVIEW, "human_escalated", "SYSTEM")
+            elif approved:
+                CaseStateMachine.transition_status(db, c, CaseStatus.APPROVED, "guard_approved", "SYSTEM")
+            else:
+                CaseStateMachine.transition_status(db, c, CaseStatus.BLOCKED, "guard_blocked", "SYSTEM", {"violations": violations})
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
 
     # Insert dynamic RecoveryAction authorization request record into database
     from app.models.case import ActionState
@@ -568,19 +740,14 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db)):
     # Check case state constraints if db record exists
     c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
     if c:
-        if not CaseStateMachine.validate_transition(c.status, CaseStatus.EXECUTING):
+        try:
+            CaseStateMachine.transition_status(db, c, CaseStatus.EXECUTING, "execute_start", "SYSTEM")
+        except ValueError as ve:
             with _execution_lock:
                 EXECUTION_REGISTRY.pop(action_id, None)
-            raise HTTPException(
-                status_code=400, detail=f"Illegal transition: {c.status} -> EXECUTING"
-            )
+            raise HTTPException(status_code=400, detail=str(ve))
 
     try:
-        # Update case state database tables dynamically on transition execution
-        if c:
-            c.status = CaseStatus.EXECUTING
-            db.commit()
-
         res = ExecutionSimulator.execute_action(
             action_type=req.action_type.value,
             amount=req.amount,
@@ -598,46 +765,91 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db)):
             target_state = (
                 CaseStatus.RECOVERED if res["recovered"] else CaseStatus.FAILED
             )
-            if CaseStateMachine.validate_transition(c.status, target_state):
-                c.status = target_state
-                # Update corresponding RecoveryAction state and execution_id in database
-                act_state = (
-                    ActionState.SUCCESSFUL if res["recovered"] else ActionState.FAILED
+            try:
+                CaseStateMachine.transition_status(
+                    db,
+                    c,
+                    target_state,
+                    "execution_result",
+                    "API_SIMULATION",
+                    {"execution_id": res["execution_id"]}
                 )
-                db_act = (
-                    db.query(RecoveryAction)
-                    .filter(
-                        RecoveryAction.case_id == case_id,
-                        RecoveryAction.action_id == action_id,
-                    )
-                    .first()
+
+                # Retry & Replanning Engine logic
+                if target_state == CaseStatus.FAILED:
+                    c.current_recovery_attempt += 1
+                    if c.current_recovery_attempt >= c.max_attempts:
+                        # Policy limits exceeded: FAILED -> CLOSED
+                        CaseStateMachine.transition_status(db, c, CaseStatus.CLOSED, "retry_limit_exhausted", "SYSTEM")
+                    else:
+                        # Budget remains: FAILED -> ANALYZING (schedule with exponential backoff)
+                        CaseStateMachine.transition_status(db, c, CaseStatus.ANALYZING, "replan_triggered", "SYSTEM")
+                        backoff_seconds = (2 ** c.current_recovery_attempt) * 300
+                        c.next_action_at = datetime.utcnow() + timedelta(seconds=backoff_seconds)
+            except ValueError as ve:
+                with _execution_lock:
+                    EXECUTION_REGISTRY.pop(action_id, None)
+                raise HTTPException(status_code=400, detail=str(ve))
+
+            # Update corresponding RecoveryAction state and execution_id in database
+            act_state = (
+                ActionState.SUCCESSFUL if res["recovered"] else ActionState.FAILED
+            )
+            db_act = (
+                db.query(RecoveryAction)
+                .filter(
+                    RecoveryAction.case_id == case_id,
+                    RecoveryAction.action_id == action_id,
                 )
-                if db_act:
-                    db_act.state = act_state
-                    db_act.execution_id = res["execution_id"]
+                .first()
+            )
+            if db_act:
+                db_act.state = act_state
+                db_act.execution_id = res["execution_id"]
 
-                # Append append-only structured audit logs mapping explainability traces
-                # Ground truth does NOT establish trusted decision source provenance.
-                decision_source = "API_SIMULATION"
-
-                log_entry = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "node": "execution",
-                    "event": "execution_result",
-                    "inputs": {
-                        "action": req.action_type.value,
-                        "amount": float(req.amount),
-                    },
-                    "outputs": {"status": res["status"], "recovered": res["recovered"]},
-                    "decision": res["status"],
-                    "confidence": 1.0,
-                    "decision_source": decision_source,
-                    "model": "fallback_rules",
-                    "request_id": res["execution_id"],
-                    "playbook_id": "PLAYBOOK_SIMULATION_DEFAULT",
+            # Persist Execution record to database
+            execution_db = Execution(
+                id=res["execution_id"],
+                action_id=db_act.id if db_act else None,
+                case_id=case_id,
+                status="SUCCESS" if res["recovered"] else "FAILED",
+                provider="razorpay",
+                provider_reference=res["execution_id"],
+                amount=req.amount,
+                currency=req.currency,
+                attempted_at=datetime.utcnow(),
+                completed_at=datetime.utcnow(),
+                result_code=res["status"],
+                failure_reason=None if res["recovered"] else res["message"],
+                metadata_json={
+                    "token_used": req.authorization_token[:15] + "...",
+                    "action_id": action_id
                 }
-                c.audit_log = (c.audit_log or []) + [log_entry]
-                db.commit()
+            )
+            db.add(execution_db)
+
+            # Append append-only structured audit logs mapping explainability traces
+            # Ground truth does NOT establish trusted decision source provenance.
+            decision_source = "API_SIMULATION"
+
+            log_entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "node": "execution",
+                "event": "execution_result",
+                "inputs": {
+                    "action": req.action_type.value,
+                    "amount": float(req.amount),
+                },
+                "outputs": {"status": res["status"], "recovered": res["recovered"]},
+                "decision": res["status"],
+                "confidence": 1.0,
+                "decision_source": decision_source,
+                "model": "fallback_rules",
+                "request_id": res["execution_id"],
+                "playbook_id": "PLAYBOOK_SIMULATION_DEFAULT",
+            }
+            c.audit_log = (c.audit_log or []) + [log_entry]
+            db.commit()
 
         # Invalidate cached metrics
         RedisCache.delete("metrics_data")
@@ -675,3 +887,92 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=500, detail=f"Simulation execution error: {str(e)}"
         )
+
+
+@router.post("/api/cases/{case_id}/review", dependencies=[Depends(verify_api_key)])
+def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get_db)):
+    c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Recovery Case not found")
+    if c.status != CaseStatus.HUMAN_REVIEW:
+        raise HTTPException(status_code=400, detail=f"Case {case_id} is not in HUMAN_REVIEW status (current: {c.status})")
+
+    action_upper = req.action.upper().strip()
+    if action_upper not in ("APPROVE", "REJECT", "CLOSE"):
+        raise HTTPException(status_code=400, detail="Invalid action. Must be APPROVE, REJECT, or CLOSE")
+
+    if action_upper == "CLOSE":
+        CaseStateMachine.transition_status(
+            db, c, CaseStatus.CLOSED, "human_closed", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes}
+        )
+        db.commit()
+        RedisCache.delete("metrics_data")
+        return {"status": "success", "message": "Case closed by human operator", "resulting_status": c.status.value}
+        
+    elif action_upper == "REJECT":
+        CaseStateMachine.transition_status(
+            db, c, CaseStatus.BLOCKED, "human_rejected", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes}
+        )
+        db.commit()
+        RedisCache.delete("metrics_data")
+        return {"status": "success", "message": "Case rejected by human operator", "resulting_status": c.status.value}
+
+    elif action_upper == "APPROVE":
+        latest_action = db.query(RecoveryAction).filter(RecoveryAction.case_id == case_id).order_by(RecoveryAction.created_at.desc()).first()
+        if not latest_action:
+            raise HTTPException(status_code=400, detail="No action found to approve on this case")
+            
+        merchant = db.query(Merchant).filter(Merchant.id == c.merchant_id).first()
+        max_retries = merchant.max_retries if merchant else 3
+        amount_threshold = float(merchant.amount_threshold) if merchant else 5000.0
+        
+        now_str = datetime.utcnow().isoformat()
+        prior_actions = db.query(RecoveryAction).filter(
+            RecoveryAction.case_id == case_id,
+            RecoveryAction.id != latest_action.id
+        ).all()
+        last_contact_at = None
+        if prior_actions:
+            last_contact = max(a.created_at for a in prior_actions)
+            last_contact_at = last_contact.isoformat()
+
+        approved, token, violations = ActionGuard.validate_action(
+            action_type=latest_action.action_type.value,
+            amount=float(c.event.amount),
+            currency=c.event.currency,
+            current_attempts=c.current_recovery_attempt,
+            max_retries=max_retries,
+            amount_threshold_inr=amount_threshold,
+            has_active_action=False,
+            last_contact_at_str=last_contact_at,
+            now_str=now_str,
+            planner_confidence=1.0,
+            case_id=case_id,
+            event_id=c.event_id,
+            action_id=latest_action.id,
+        )
+
+        if not approved:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ActionGuard blocked approval due to violations: {violations}"
+            )
+
+        latest_action.state = ActionState.APPROVED_BY_GUARD
+        latest_action.authorization_token = token
+        db.flush()
+
+        CaseStateMachine.transition_status(
+            db, c, CaseStatus.APPROVED, "human_approved", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes, "action_id": latest_action.id}
+        )
+        db.commit()
+
+        # Trigger execution in background via queue
+        from app.services.queue import RedisQueue
+        try:
+            RedisQueue().enqueue("execute_case", {"case_id": c.id})
+        except Exception as e:
+            print(f"Human review queue warning: Failed to enqueue evaluate_case/execute: {e}")
+
+        RedisCache.delete("metrics_data")
+        return {"status": "success", "message": "Case approved by human operator and scheduled for execution", "resulting_status": c.status.value}
