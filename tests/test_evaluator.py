@@ -24,6 +24,9 @@ class TestBatchEvaluator(unittest.TestCase):
         self.assertTrue(os.path.exists(out_path))
 
     def test_evaluator_council_mode_runs(self):
+        ai_service_path = Path(__file__).parent.parent.parent / "ai-service"
+        if not ai_service_path.exists():
+            self.skipTest("ai-service directory not found (skipping council mode test in CI environment)")
         # 2. Test AI Council mode evaluation limit 15 (Runs transactions through 5-Agent LangGraph)
         res = BatchEvaluator.evaluate_batch(self.events_path, limit=15, stratify=True, mode="council")
         self.assertEqual(res["total_cases"], 15)
