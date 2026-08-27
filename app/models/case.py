@@ -87,7 +87,7 @@ class PaymentEvent(Base):
     currency = Column(String, default="INR")
     failure_code = Column(String, nullable=True)
     provider = Column(String, default="razorpay")
-    provider_event_id = Column(String, nullable=True)
+    provider_event_id = Column(String, nullable=True, unique=True)
     payload_metadata = Column(JSON, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
@@ -122,7 +122,7 @@ class RecoveryAction(Base):
     proposed_by = Column(String, nullable=False)
     state = Column(Enum(ActionState), default=ActionState.PROPOSED)
     authorization_token = Column(String, nullable=True)
-    action_id = Column(String, nullable=True)
+    action_id = Column(String, nullable=True, unique=True)
     execution_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -137,7 +137,7 @@ class Execution(Base):
     case_id = Column(String, ForeignKey("recovery_cases.id"), nullable=False)
     status = Column(String, nullable=False)  # SUCCESS, FAILED
     provider = Column(String, default="razorpay")
-    provider_reference = Column(String, nullable=True)
+    provider_reference = Column(String, nullable=True, unique=True)
     amount = Column(Numeric(12, 2), nullable=False)
     currency = Column(String, default="INR")
     attempted_at = Column(DateTime, default=datetime.utcnow)
@@ -160,6 +160,26 @@ class AuditEvent(Base):
 
     case = relationship("RecoveryCase", back_populates="audit_events")
     action = relationship("RecoveryAction", back_populates="audit_events")
+
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    event_type = Column(String, nullable=False)
+    aggregate_id = Column(String, nullable=False)
+    payload = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    published_at = Column(DateTime, nullable=True)
+    attempt_count = Column(Integer, default=0)
+    last_error = Column(String, nullable=True)
+
+
+class WebhookEvent(Base):
+    __tablename__ = "webhook_events"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    provider_event_id = Column(String, nullable=False, unique=True)
+    payload = Column(JSON, nullable=False)
+    processed_at = Column(DateTime, default=datetime.utcnow)
 
 
 

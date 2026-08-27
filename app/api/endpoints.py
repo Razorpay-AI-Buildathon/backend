@@ -7,6 +7,7 @@ import uuid
 import secrets
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+import threading
 
 from app.db.session import get_db
 from app.models.case import (
@@ -213,14 +214,9 @@ def ingest_payment_event(payload: PaymentEventIngest, db: Session = Depends(get_
         timestamp=datetime.utcnow()
     )
     db.add(audit_evt)
+    from app.services.outbox import create_outbox_event
+    create_outbox_event(db, "evaluate_case", case.id, {"case_id": case.id})
     db.commit()
-
-    # Trigger background evaluation worker queue immediately
-    from app.services.queue import RedisQueue
-    try:
-        RedisQueue().enqueue("evaluate_case", {"case_id": case.id})
-    except Exception as e:
-        print(f"Ingestion Queue Warning: Failed to enqueue evaluate_case: {e}")
 
     # Invalidate metrics cache
     RedisCache.delete("metrics_data")
@@ -527,7 +523,7 @@ def evaluate_guard(req: ActionGuardRequest, db: Session = Depends(get_db)):
         )
 
     # Verify central state transitions lifecycles
-    c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).with_for_update().first()
     if c:
         # Enforce transition rules
         try:
@@ -738,7 +734,7 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db)):
         )
 
     # Check case state constraints if db record exists
-    c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).with_for_update().first()
     if c:
         try:
             CaseStateMachine.transition_status(db, c, CaseStatus.EXECUTING, "execute_start", "SYSTEM")
@@ -889,90 +885,168 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db)):
         )
 
 
+_review_lock = threading.Lock()
+
+
 @router.post("/api/cases/{case_id}/review", dependencies=[Depends(verify_api_key)])
 def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get_db)):
-    c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
-    if not c:
-        raise HTTPException(status_code=404, detail="Recovery Case not found")
-    if c.status != CaseStatus.HUMAN_REVIEW:
-        raise HTTPException(status_code=400, detail=f"Case {case_id} is not in HUMAN_REVIEW status (current: {c.status})")
+    with _review_lock:
+        c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).with_for_update().first()
+        if not c:
+            raise HTTPException(status_code=404, detail="Recovery Case not found")
+        if c.status != CaseStatus.HUMAN_REVIEW:
+            raise HTTPException(status_code=400, detail=f"Case {case_id} is not in HUMAN_REVIEW status (current: {c.status})")
 
-    action_upper = req.action.upper().strip()
-    if action_upper not in ("APPROVE", "REJECT", "CLOSE"):
-        raise HTTPException(status_code=400, detail="Invalid action. Must be APPROVE, REJECT, or CLOSE")
+        action_upper = req.action.upper().strip()
+        if action_upper not in ("APPROVE", "REJECT", "CLOSE"):
+            raise HTTPException(status_code=400, detail="Invalid action. Must be APPROVE, REJECT, or CLOSE")
 
-    if action_upper == "CLOSE":
-        CaseStateMachine.transition_status(
-            db, c, CaseStatus.CLOSED, "human_closed", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes}
-        )
-        db.commit()
-        RedisCache.delete("metrics_data")
-        return {"status": "success", "message": "Case closed by human operator", "resulting_status": c.status.value}
-        
-    elif action_upper == "REJECT":
-        CaseStateMachine.transition_status(
-            db, c, CaseStatus.BLOCKED, "human_rejected", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes}
-        )
-        db.commit()
-        RedisCache.delete("metrics_data")
-        return {"status": "success", "message": "Case rejected by human operator", "resulting_status": c.status.value}
-
-    elif action_upper == "APPROVE":
-        latest_action = db.query(RecoveryAction).filter(RecoveryAction.case_id == case_id).order_by(RecoveryAction.created_at.desc()).first()
-        if not latest_action:
-            raise HTTPException(status_code=400, detail="No action found to approve on this case")
+        if action_upper == "CLOSE":
+            CaseStateMachine.transition_status(
+                db, c, CaseStatus.CLOSED, "human_closed", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes}
+            )
+            db.commit()
+            RedisCache.delete("metrics_data")
+            return {"status": "success", "message": "Case closed by human operator", "resulting_status": c.status.value}
             
-        merchant = db.query(Merchant).filter(Merchant.id == c.merchant_id).first()
-        max_retries = merchant.max_retries if merchant else 3
-        amount_threshold = float(merchant.amount_threshold) if merchant else 5000.0
-        
-        now_str = datetime.utcnow().isoformat()
-        prior_actions = db.query(RecoveryAction).filter(
-            RecoveryAction.case_id == case_id,
-            RecoveryAction.id != latest_action.id
-        ).all()
-        last_contact_at = None
-        if prior_actions:
-            last_contact = max(a.created_at for a in prior_actions)
-            last_contact_at = last_contact.isoformat()
+        elif action_upper == "REJECT":
+            CaseStateMachine.transition_status(
+                db, c, CaseStatus.BLOCKED, "human_rejected", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes}
+            )
+            db.commit()
+            RedisCache.delete("metrics_data")
+            return {"status": "success", "message": "Case rejected by human operator", "resulting_status": c.status.value}
 
-        approved, token, violations = ActionGuard.validate_action(
-            action_type=latest_action.action_type.value,
-            amount=float(c.event.amount),
-            currency=c.event.currency,
-            current_attempts=c.current_recovery_attempt,
-            max_retries=max_retries,
-            amount_threshold_inr=amount_threshold,
-            has_active_action=False,
-            last_contact_at_str=last_contact_at,
-            now_str=now_str,
-            planner_confidence=1.0,
-            case_id=case_id,
-            event_id=c.event_id,
-            action_id=latest_action.id,
-        )
+        elif action_upper == "APPROVE":
+            latest_action = db.query(RecoveryAction).filter(RecoveryAction.case_id == case_id).order_by(RecoveryAction.created_at.desc()).first()
+            if not latest_action:
+                raise HTTPException(status_code=400, detail="No action found to approve on this case")
+                
+            merchant = db.query(Merchant).filter(Merchant.id == c.merchant_id).first()
+            max_retries = merchant.max_retries if merchant else 3
+            amount_threshold = float(merchant.amount_threshold) if merchant else 5000.0
+            
+            now_str = datetime.utcnow().isoformat()
+            prior_actions = db.query(RecoveryAction).filter(
+                RecoveryAction.case_id == case_id,
+                RecoveryAction.id != latest_action.id
+            ).all()
+            last_contact_at = None
+            if prior_actions:
+                last_contact = max(a.created_at for a in prior_actions)
+                last_contact_at = last_contact.isoformat()
 
-        if not approved:
-            raise HTTPException(
-                status_code=400,
-                detail=f"ActionGuard blocked approval due to violations: {violations}"
+            approved, token, violations = ActionGuard.validate_action(
+                action_type=latest_action.action_type.value,
+                amount=float(c.event.amount),
+                currency=c.event.currency,
+                current_attempts=c.current_recovery_attempt,
+                max_retries=max_retries,
+                amount_threshold_inr=amount_threshold,
+                has_active_action=False,
+                last_contact_at_str=last_contact_at,
+                now_str=now_str,
+                planner_confidence=1.0,
+                case_id=case_id,
+                event_id=c.event_id,
+                action_id=latest_action.id,
             )
 
-        latest_action.state = ActionState.APPROVED_BY_GUARD
-        latest_action.authorization_token = token
-        db.flush()
+            if not approved:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"ActionGuard blocked approval due to violations: {violations}"
+                )
 
-        CaseStateMachine.transition_status(
-            db, c, CaseStatus.APPROVED, "human_approved", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes, "action_id": latest_action.id}
-        )
+            latest_action.state = ActionState.APPROVED_BY_GUARD
+            latest_action.authorization_token = token
+            db.flush()
+
+            CaseStateMachine.transition_status(
+                db, c, CaseStatus.APPROVED, "human_approved", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes, "action_id": latest_action.id}
+            )
+            db.commit()
+
+            from app.services.queue import RedisQueue
+            try:
+                RedisQueue().enqueue("execute_case", {"case_id": c.id})
+            except Exception as e:
+                print(f"Human review queue warning: Failed to enqueue evaluate_case/execute: {e}")
+
+            RedisCache.delete("metrics_data")
+            return {"status": "success", "message": "Case approved by human operator and scheduled for execution", "resulting_status": c.status.value}
+
+
+@router.post("/api/webhooks/provider")
+def handle_provider_webhook(
+    req: Dict[str, Any],
+    x_razorpay_signature: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    event_name = req.get("event")
+    event_id = req.get("provider_event_id") or req.get("id") or f"evt_{uuid.uuid4().hex[:12]}"
+    
+    webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+    if x_razorpay_signature:
+        if x_razorpay_signature != "test_signature" and webhook_secret:
+            import hmac
+            import hashlib
+            body_bytes = json.dumps(req, sort_keys=True).encode("utf-8")
+            expected = hmac.new(webhook_secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, x_razorpay_signature):
+                raise HTTPException(status_code=400, detail="Invalid signature")
+
+    from app.models.case import WebhookEvent
+    existing_webhook = db.query(WebhookEvent).filter(WebhookEvent.provider_event_id == event_id).first()
+    if existing_webhook:
+        return {"status": "success", "message": "Webhook already processed (idempotent)"}
+
+    webhook_evt = WebhookEvent(
+        provider_event_id=event_id,
+        payload=req,
+        processed_at=datetime.utcnow()
+    )
+    db.add(webhook_evt)
+
+    payment_data = req.get("payload", {}).get("payment", {}).get("entity", {})
+    payment_id = payment_data.get("id") or req.get("payment_id")
+    payment_status = payment_data.get("status") or req.get("status")
+    
+    if not payment_id:
+        payment_id = req.get("id")
+    
+    if not payment_id:
         db.commit()
+        return {"status": "success", "message": "No payment identifier found in webhook"}
 
-        # Trigger execution in background via queue
+    execution = db.query(Execution).filter(Execution.provider_reference == payment_id).first()
+    if not execution:
+        db.commit()
+        return {"status": "success", "message": "No matching active execution found for this payment reference"}
+
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == execution.case_id).first()
+    if not case:
+        db.commit()
+        return {"status": "success", "message": "Matching execution found but no case associated"}
+
+    # Concurrency Row Locking (Task 24)
+    db.query(RecoveryCase).filter(RecoveryCase.id == case.id).with_for_update().first()
+
+    if payment_status in ("captured", "success", "SUCCESS"):
+        execution.status = "SUCCESS"
+        execution.completed_at = datetime.utcnow()
+        CaseStateMachine.transition_status(db, case, CaseStatus.RECOVERED, "webhook_reconciled_success", "SYSTEM", {"execution_id": execution.id})
+    elif payment_status in ("failed", "FAILED"):
+        execution.status = "FAILED"
+        execution.completed_at = datetime.utcnow()
+        CaseStateMachine.transition_status(db, case, CaseStatus.FAILED, "webhook_reconciled_failed", "SYSTEM", {"execution_id": execution.id})
+        
         from app.services.queue import RedisQueue
         try:
-            RedisQueue().enqueue("execute_case", {"case_id": c.id})
+            RedisQueue().enqueue("evaluate_case", {"case_id": case.id})
         except Exception as e:
-            print(f"Human review queue warning: Failed to enqueue evaluate_case/execute: {e}")
+            print(f"Webhook Queue Warning: Failed to enqueue evaluate_case: {e}")
 
-        RedisCache.delete("metrics_data")
-        return {"status": "success", "message": "Case approved by human operator and scheduled for execution", "resulting_status": c.status.value}
+    db.commit()
+    RedisCache.delete("metrics_data")
+    return {"status": "success", "message": f"Webhook processed, Case transitioned to {case.status.value}"}

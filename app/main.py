@@ -44,6 +44,8 @@ def start_redis_background_services():
 
     # 2. Start RedisScheduler polling thread
     def run_scheduler():
+        from app.services.outbox import OutboxPublisher
+        from app.db.session import SessionLocal
         scheduler = RedisScheduler()
         queue = RedisQueue()
         while True:
@@ -53,7 +55,17 @@ def start_redis_background_services():
                     queue.enqueue(task["task_name"], task["payload"])
             except Exception as e:
                 print(f"RedisScheduler: Error polling due tasks: {e}")
-            time.sleep(2)  # Check scheduled tasks every 2 seconds
+
+            try:
+                db = SessionLocal()
+                try:
+                    OutboxPublisher.publish_pending_events(db)
+                finally:
+                    db.close()
+            except Exception as e:
+                print(f"OutboxPublisher: Error publishing outbox: {e}")
+
+            time.sleep(2)  # Check scheduled tasks and outbox every 2 seconds
 
     threading.Thread(target=run_worker, daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
