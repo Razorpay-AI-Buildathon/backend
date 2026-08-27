@@ -1050,3 +1050,25 @@ def handle_provider_webhook(
     db.commit()
     RedisCache.delete("metrics_data")
     return {"status": "success", "message": f"Webhook processed, Case transitioned to {case.status.value}"}
+
+
+@router.get("/api/cases/stream")
+async def sse_cases_stream():
+    import asyncio
+    from fastapi.responses import StreamingResponse
+    from app.services.sse import sse_manager
+    
+    async def event_generator():
+        q = asyncio.Queue()
+        sse_manager.register(q)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=20.0)
+                    yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        finally:
+            sse_manager.unregister(q)
+            
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

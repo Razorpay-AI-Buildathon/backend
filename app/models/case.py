@@ -346,4 +346,11 @@ class CaseStateMachine:
         )
         db.add(audit_evt)
         db.flush()
+
+        try:
+            from app.services.sse import sse_manager
+            sse_manager.publish("case_updated", {"case_id": case.id, "status": target_status.value})
+        except Exception as e:
+            print(f"SSE Publish Warning: Failed to publish transition event: {e}")
+
         return True
