@@ -22,12 +22,15 @@ from app.models.case import (
 )
 from app.services.scoring import calculate_erv, calculate_priority_score
 
-def populate():
-    print("Connecting to database and dropping/creating tables...")
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
-    
+import argparse
+
+def populate(reset=False, count=None, demo=False):
     db = SessionLocal()
+    
+    if reset:
+        print("Connecting to database and dropping/creating tables (--reset)...")
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
     
     events_path = Path(__file__).parent.parent.parent / "tests" / "synthetic_events.json"
     if not events_path.exists():
@@ -38,18 +41,25 @@ def populate():
     with open(events_path, "r") as f:
         events = json.load(f)
         
+    if count is not None:
+        events = events[:count]
+        print(f"Limiting seed to first {count} events...")
+        
     print(f"Ingesting {len(events)} events into the database...")
     
     # Pre-create a default merchant
-    default_merchant = Merchant(
-        id="merch-default",
-        name="Demo Merchant",
-        razorpay_key_id="rzp_test_demo",
-        razorpay_key_secret="rzp_secret_demo",
-        amount_threshold=5000.00,
-        max_retries=3
-    )
-    db.add(default_merchant)
+    default_merchant = db.query(Merchant).filter(Merchant.id == "merch-default").first()
+    if not default_merchant:
+        default_merchant = Merchant(
+            id="merch-default",
+            name="Demo Merchant",
+            razorpay_key_id="rzp_test_demo",
+            razorpay_key_secret="rzp_secret_demo",
+            amount_threshold=5000.00,
+            max_retries=3
+        )
+        db.add(default_merchant)
+        db.flush()
     
     for idx, e_data in enumerate(events):
         # 1. Create Customer
@@ -70,102 +80,112 @@ def populate():
         amount = Decimal(str(e_data["amount"]))
         failure_code = e_data.get("failure_code")
         
-        event = PaymentEvent(
-            id=e_data["id"],
-            event_type=e_data["event_type"],
-            amount=amount,
-            currency=e_data["currency"],
-            failure_code=failure_code,
-            payload_metadata=e_data.get("payload_metadata", {}),
-            timestamp=datetime.fromisoformat(e_data["timestamp"].replace("Z", "+00:00"))
-        )
-        db.add(event)
-        db.flush()
+        event = db.query(PaymentEvent).filter(PaymentEvent.id == e_data["id"]).first()
+        if not event:
+            event = PaymentEvent(
+                id=e_data["id"],
+                event_type=e_data["event_type"],
+                amount=amount,
+                currency=e_data["currency"],
+                failure_code=failure_code,
+                payload_metadata=e_data.get("payload_metadata", {}),
+                timestamp=datetime.fromisoformat(e_data["timestamp"].replace("Z", "+00:00"))
+            )
+            db.add(event)
+            db.flush()
         
         # 3. Create RecoveryCase
-        recovery_context = e_data.get("recovery_context", {})
-        attempt = recovery_context.get("attempt_number", 0)
-        
-        # Calculate ERV and Priority Score
-        erv = calculate_erv(
-            amount=amount,
-            currency=e_data["currency"],
-            failure_code=failure_code,
-            history_success_rate=cust_history["success_rate"],
-            attempt=attempt
-        )
-        
-        priority = calculate_priority_score(
-            amount=amount,
-            currency=e_data["currency"],
-            failure_code=failure_code,
-            history_success_rate=cust_history["success_rate"],
-            attempt=attempt
-        )
-        
-        # Determine status
-        ground_truth = e_data.get("ground_truth", {})
-        recovered = ground_truth.get("recovered", False)
-        recommended_action = ground_truth.get("recommended_action")
-        
-        status = CaseStatus.IDENTIFIED
-        if recovered:
-            status = CaseStatus.RECOVERED
-        elif attempt >= 3:
-            status = CaseStatus.FAILED
-        elif recommended_action == "ESCALATE_TO_HUMAN":
-            status = CaseStatus.HUMAN_REVIEW
-        elif recommended_action == "DO_NOTHING":
-            status = CaseStatus.BLOCKED
+        case = db.query(RecoveryCase).filter(RecoveryCase.id == e_data["id"]).first()
+        if not case:
+            attempt = recovery_context = e_data.get("recovery_context", {}).get("attempt_number", 0)
             
-        case = RecoveryCase(
-            id=e_data["id"],
-            event_id=event.id,
-            status=status,
-            priority_score=priority,
-            expected_recovery_value=erv,
-            current_recovery_attempt=attempt,
-            audit_log=[
-                {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "node": "ingestion",
-                    "event": "event_received",
-                    "inputs": {"event_type": event.event_type, "amount": float(amount)},
-                    "outputs": {"status": "success"},
-                    "decision": "IDENTIFIED",
-                    "confidence": 1.0,
-                    "decision_source": "SYSTEM",
-                    "model": "rule_engine"
-                }
-            ],
-            created_at=datetime.fromisoformat(e_data["timestamp"].replace("Z", "+00:00"))
-        )
-        db.add(case)
-        db.flush()
-        
-        # 4. Create RecoveryAction if there was a proposed action in ground truth
-        if recommended_action and recommended_action != "DO_NOTHING":
-            action_state = ActionState.PROPOSED
-            if status == CaseStatus.RECOVERED:
-                action_state = ActionState.SUCCESSFUL
-            elif status == CaseStatus.FAILED:
-                action_state = ActionState.FAILED
-                
-            action = RecoveryAction(
-                case_id=case.id,
-                action_type=ActionType(recommended_action),
-                proposed_by="AI_Council",
-                state=action_state,
-                authorization_token=f"AUTH-EXEC-{uuid.uuid4().hex[:12].upper()}",
-                action_id=f"act-{case.id[:8]}",
-                execution_id=f"exec-{case.id[:8]}" if recovered else None,
-                created_at=case.created_at
+            # Calculate ERV and Priority Score
+            erv = calculate_erv(
+                amount=amount,
+                currency=e_data["currency"],
+                failure_code=failure_code,
+                history_success_rate=cust_history["success_rate"],
+                attempt=attempt
             )
-            db.add(action)
             
+            priority = calculate_priority_score(
+                amount=amount,
+                currency=e_data["currency"],
+                failure_code=failure_code,
+                history_success_rate=cust_history["success_rate"],
+                attempt=attempt
+            )
+            
+            # Determine status
+            ground_truth = e_data.get("ground_truth", {})
+            recovered = ground_truth.get("recovered", False)
+            recommended_action = ground_truth.get("recommended_action")
+            
+            status = CaseStatus.IDENTIFIED
+            if recovered:
+                status = CaseStatus.RECOVERED
+            elif attempt >= 3:
+                status = CaseStatus.FAILED
+            elif recommended_action == "ESCALATE_TO_HUMAN":
+                status = CaseStatus.HUMAN_REVIEW
+            elif recommended_action == "DO_NOTHING":
+                status = CaseStatus.BLOCKED
+                
+            case = RecoveryCase(
+                id=e_data["id"],
+                event_id=event.id,
+                status=status,
+                priority_score=priority,
+                expected_recovery_value=erv,
+                current_recovery_attempt=attempt,
+                experiment_group="TREATMENT" if not demo else "CONTROL",
+                audit_log=[
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "node": "ingestion",
+                        "event": "event_received",
+                        "inputs": {"event_type": event.event_type, "amount": float(amount)},
+                        "outputs": {"status": "success"},
+                        "decision": "IDENTIFIED",
+                        "confidence": 1.0,
+                        "decision_source": "SYSTEM",
+                        "model": "rule_engine"
+                    }
+                ],
+                created_at=datetime.fromisoformat(e_data["timestamp"].replace("Z", "+00:00"))
+            )
+            db.add(case)
+            db.flush()
+            
+            # 4. Create RecoveryAction if there was a proposed action in ground truth
+            if recommended_action and recommended_action != "DO_NOTHING":
+                action_state = ActionState.PROPOSED
+                if status == CaseStatus.RECOVERED:
+                    action_state = ActionState.SUCCESSFUL
+                elif status == CaseStatus.FAILED:
+                    action_state = ActionState.FAILED
+                    
+                action = RecoveryAction(
+                    case_id=case.id,
+                    action_type=ActionType(recommended_action),
+                    proposed_by="AI_Council",
+                    state=action_state,
+                    authorization_token=f"AUTH-EXEC-{uuid.uuid4().hex[:12].upper()}",
+                    action_id=f"act-{case.id[:8]}",
+                    execution_id=f"exec-{case.id[:8]}" if recovered else None,
+                    created_at=case.created_at
+                )
+                db.add(action)
+                
     db.commit()
     db.close()
     print("Database population completed successfully!")
 
 if __name__ == "__main__":
-    populate()
+    parser = argparse.ArgumentParser(description="Populate RecoverAI database with synthetic events")
+    parser.add_argument("--reset", action="store_true", help="Reset database tables before populating")
+    parser.add_argument("--count", type=int, default=None, help="Maximum number of events to seed")
+    parser.add_argument("--demo", action="store_true", help="Seed specifically structured demo cases (CONTROL group)")
+    args = parser.parse_args()
+    
+    populate(reset=args.reset, count=args.count, demo=args.demo)

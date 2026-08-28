@@ -122,6 +122,42 @@ def get_health():
     return {"status": "ok", "service": "recoverai-backend"}
 
 
+@router.get("/ready")
+def get_ready(db: Session = Depends(get_db)):
+    # Verify database connectivity
+    from sqlalchemy import text
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database offline: {e}")
+
+    # Verify Redis connectivity
+    try:
+        from app.services.redis_cache import RedisCache
+        RedisCache.set("ready_check_ping", "pong", expire_seconds=5)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Redis offline: {e}")
+
+    # Verify AI Service availability
+    import httpx
+    ai_service_url = os.getenv("AI_SERVICE_URL", "http://recoverai-ai-service:8001")
+    try:
+        resp = httpx.get(f"{ai_service_url}/health", timeout=2.0)
+        if resp.status_code != 200:
+            raise Exception("AI service unhealthy status code")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"AI service offline: {e}")
+
+    return {
+        "status": "ready",
+        "dependencies": {
+            "database": "ok",
+            "redis": "ok",
+            "ai_service": "ok"
+        }
+    }
+
+
 @router.post("/api/events/payment", response_model=PaymentEventIngestResponse)
 def ingest_payment_event(payload: PaymentEventIngest, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
     if merchant_id:
@@ -1394,3 +1430,119 @@ def detect_timeouts(db: Session = Depends(get_db), merchant_id: Optional[str] = 
         
     db.commit()
     return {"status": "success", "processed": reconfigured}
+
+
+from pydantic import BaseModel
+
+class AdminControlRequest(BaseModel):
+    action: str  # PAUSE, RESUME, RETRY, CANCEL, ESCALATE, CLOSE
+    operator_id: str
+    notes: Optional[str] = None
+
+
+class CleanupPiiRequest(BaseModel):
+    retention_days: int = 30
+
+
+@router.post("/api/cases/{case_id}/admin-control")
+def admin_control_case(
+    case_id: str,
+    req: AdminControlRequest,
+    db: Session = Depends(get_db),
+    merchant_id: Optional[str] = Depends(verify_api_key)
+):
+    # Operator must be authenticated (verify_api_key throws 401 if missing)
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    if merchant_id and case.merchant_id and case.merchant_id != merchant_id:
+        raise HTTPException(status_code=403, detail="Access forbidden: Tenant ID mismatch")
+
+    action_upper = req.action.upper()
+    valid_actions = {"PAUSE", "RESUME", "RETRY", "CANCEL", "ESCALATE", "CLOSE"}
+    if action_upper not in valid_actions:
+        raise HTTPException(status_code=400, detail=f"Invalid action. Must be one of {valid_actions}")
+
+    # Log to AuditEvent table
+    from app.models.case import AuditEvent
+
+    target_status = None
+    if action_upper == "PAUSE":
+        target_status = CaseStatus.HUMAN_REVIEW
+    elif action_upper == "RESUME":
+        target_status = CaseStatus.ANALYZING
+    elif action_upper == "RETRY":
+        case.current_recovery_attempt = 0
+        target_status = CaseStatus.ANALYZING
+    elif action_upper == "CANCEL":
+        target_status = CaseStatus.CLOSED
+    elif action_upper == "ESCALATE":
+        target_status = CaseStatus.HUMAN_REVIEW
+    elif action_upper == "CLOSE":
+        target_status = CaseStatus.CLOSED
+
+    # Transition state using force=True for admin controls
+    CaseStateMachine.transition_status(
+        db, case, target_status, f"operator_{action_upper.lower()}",
+        actor=req.operator_id, details={"notes": req.notes}, force=True
+    )
+    
+    audit_evt = AuditEvent(
+        case_id=case.id,
+        event_type=f"OPERATOR_{action_upper}",
+        actor=req.operator_id,
+        decision_source="HUMAN",
+        metadata_json={"notes": req.notes, "previous_status": case.status.value if hasattr(case.status, 'value') else str(case.status)},
+        timestamp=datetime.utcnow()
+    )
+    db.add(audit_evt)
+    db.commit()
+
+    # Trigger worker if resuming or retrying
+    if action_upper in ("RESUME", "RETRY"):
+        from app.services.queue import RedisQueue
+        try:
+            RedisQueue().enqueue("evaluate_case", {"case_id": case.id})
+        except Exception as e:
+            print(f"Admin Queue Warning: Failed to enqueue evaluate_case: {e}")
+
+    return {"status": "success", "message": f"Action {action_upper} applied successfully to case {case_id}."}
+
+
+@router.post("/api/admin/cleanup-pii")
+def cleanup_pii(
+    req: CleanupPiiRequest,
+    db: Session = Depends(get_db),
+    merchant_id: Optional[str] = Depends(verify_api_key)
+):
+    # Enforce authentication
+    cutoff = datetime.utcnow() - timedelta(days=req.retention_days)
+    
+    # Query closed cases older than retention days
+    old_cases_query = db.query(RecoveryCase).filter(
+        RecoveryCase.closed_at != None,
+        RecoveryCase.closed_at < cutoff
+    )
+    if merchant_id:
+        old_cases_query = old_cases_query.filter(RecoveryCase.merchant_id == merchant_id)
+        
+    old_cases = old_cases_query.all()
+    count = len(old_cases)
+    
+    for case in old_cases:
+        # PII Minimization: Anonymize Customer info
+        customer = db.query(Customer).filter(Customer.id == case.customer_id).first()
+        if customer:
+            customer.email = "redacted@example.com"
+            customer.phone = "redacted"
+            db.add(customer)
+            
+        # Metadata Limits: Clear/minimize PaymentEvent payload_metadata
+        event = db.query(PaymentEvent).filter(PaymentEvent.id == case.event_id).first()
+        if event:
+            event.payload_metadata = {"status": "pii_redacted"}
+            db.add(event)
+
+    db.commit()
+    return {"status": "success", "redacted_cases_count": count}
