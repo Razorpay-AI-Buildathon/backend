@@ -1,6 +1,6 @@
 import os
 import time
-import requests
+import httpx
 import uuid
 import random
 from datetime import datetime, timezone, timedelta
@@ -133,7 +133,7 @@ class RecoveryWorker:
             }
 
             try:
-                resp = requests.post(f"{ai_service_url}/analyze-event", json=state_input, timeout=10)
+                resp = httpx.post(f"{ai_service_url}/analyze-event", json=state_input, timeout=10.0)
                 if resp.status_code != 200:
                     raise Exception(f"AI Service HTTP error {resp.status_code}")
                 ai_data = resp.json()
