@@ -7,6 +7,8 @@ from sqlalchemy import (
     Numeric,
     JSON,
     Enum,
+    Boolean,
+    Float,
 )
 # pyrefly: ignore [missing-import]
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -108,10 +110,13 @@ class RecoveryCase(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     closed_at = Column(DateTime, nullable=True)
+    policy_id = Column(String, ForeignKey("merchant_recovery_policies.id"), nullable=True)
+    policy_version = Column(Integer, nullable=True)
 
     event = relationship("PaymentEvent")
     actions = relationship("RecoveryAction", back_populates="case")
     audit_events = relationship("AuditEvent", back_populates="case", cascade="all, delete-orphan")
+    policy = relationship("MerchantRecoveryPolicy")
 
 
 class RecoveryAction(Base):
@@ -180,6 +185,51 @@ class WebhookEvent(Base):
     provider_event_id = Column(String, nullable=False, unique=True)
     payload = Column(JSON, nullable=False)
     processed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class MerchantRecoveryPolicy(Base):
+    __tablename__ = "merchant_recovery_policies"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    merchant_id = Column(String, ForeignKey("merchants.id"), nullable=False)
+    max_attempts = Column(Integer, default=3)
+    retry_backoff = Column(Integer, default=300) # baseline cooldown in seconds
+    amount_threshold = Column(Numeric(12, 2), default=5000.00)
+    allowed_actions = Column(JSON, default=list)
+    human_review_threshold = Column(Numeric(5, 2), default=70.00) # AI confidence under which human review is triggered
+    risk_threshold = Column(Numeric(5, 2), default=80.00) # risk score above which human review is triggered
+    cooldown = Column(Integer, default=3600)
+    enabled = Column(Boolean, default=True)
+    version = Column(Integer, default=1)
+
+    merchant = relationship("Merchant")
+
+
+class AiDecision(Base):
+    __tablename__ = "ai_decisions"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    case_id = Column(String, ForeignKey("recovery_cases.id"), nullable=False)
+    action_id = Column(String, ForeignKey("recovery_actions.id"), nullable=True)
+    model = Column(String, nullable=False)
+    model_version = Column(String, nullable=False)
+    prompt_version = Column(String, nullable=False)
+    strategy_version = Column(String, nullable=False)
+    playbook_version = Column(String, nullable=False)
+    input_context_hash = Column(String, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    confidence = Column(Float, nullable=False)
+    proposal = Column(String, nullable=False)
+
+
+class DeadLetterJob(Base):
+    __tablename__ = "dead_letter_jobs"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id = Column(String, nullable=False)
+    case_id = Column(String, nullable=False)
+    payload = Column(JSON, nullable=False)
+    failure_reason = Column(String, nullable=False)
+    retry_count = Column(Integer, default=0)
+    last_error = Column(String, nullable=True)
+    failed_at = Column(DateTime, default=datetime.utcnow)
 
 
 

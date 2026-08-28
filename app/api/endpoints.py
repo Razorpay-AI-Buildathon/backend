@@ -36,6 +36,8 @@ from app.schemas.api import (
     MetricsResponse,
     ActionTypeEnum,
     HumanReviewRequest,
+    MerchantPolicyCreate,
+    MerchantPolicyResponse,
 )
 from app.services.scoring import (
     calculate_erv,
@@ -1115,3 +1117,74 @@ async def sse_cases_stream():
             sse_manager.unregister(q)
             
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/api/policies", response_model=MerchantPolicyResponse, dependencies=[Depends(verify_api_key)])
+def create_merchant_policy(req: MerchantPolicyCreate, db: Session = Depends(get_db)):
+    from app.models.case import MerchantRecoveryPolicy
+    
+    # Check if a policy already exists for this merchant to auto-increment version
+    existing = db.query(MerchantRecoveryPolicy).filter(
+        MerchantRecoveryPolicy.merchant_id == req.merchant_id
+    ).order_by(MerchantRecoveryPolicy.version.desc()).first()
+    
+    next_version = (existing.version + 1) if existing else 1
+    
+    # Disable previous versions
+    if existing:
+        db.query(MerchantRecoveryPolicy).filter(
+            MerchantRecoveryPolicy.merchant_id == req.merchant_id
+        ).update({"enabled": False})
+        
+    policy = MerchantRecoveryPolicy(
+        merchant_id=req.merchant_id,
+        max_attempts=req.max_attempts,
+        retry_backoff=req.retry_backoff,
+        amount_threshold=req.amount_threshold,
+        allowed_actions=req.allowed_actions,
+        human_review_threshold=req.human_review_threshold,
+        risk_threshold=req.risk_threshold,
+        cooldown=req.cooldown,
+        enabled=req.enabled,
+        version=next_version
+    )
+    db.add(policy)
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+@router.get("/api/policies/{merchant_id}", response_model=MerchantPolicyResponse, dependencies=[Depends(verify_api_key)])
+def get_merchant_policy(merchant_id: str, db: Session = Depends(get_db)):
+    from app.models.case import MerchantRecoveryPolicy
+    policy = db.query(MerchantRecoveryPolicy).filter(
+        MerchantRecoveryPolicy.merchant_id == merchant_id,
+        MerchantRecoveryPolicy.enabled == True
+    ).order_by(MerchantRecoveryPolicy.version.desc()).first()
+    
+    if not policy:
+        raise HTTPException(status_code=404, detail="Active Merchant Recovery Policy not found")
+    return policy
+
+
+@router.post("/api/cases/detect-timeouts", dependencies=[Depends(verify_api_key)])
+def detect_timeouts(db: Session = Depends(get_db)):
+    from app.models.case import RecoveryCase, CaseStatus, CaseStateMachine
+    from datetime import datetime, timezone, timedelta
+    
+    timeout_threshold = datetime.utcnow() - timedelta(minutes=30)
+    stuck_cases = db.query(RecoveryCase).filter(
+        RecoveryCase.status.in_([CaseStatus.EXECUTING, CaseStatus.ANALYZING]),
+        RecoveryCase.updated_at < timeout_threshold
+    ).all()
+    
+    reconfigured = 0
+    for case in stuck_cases:
+        CaseStateMachine.transition_status(
+            db, case, CaseStatus.HUMAN_REVIEW, "timeout_detected", "SYSTEM",
+            {"reason": f"Case stuck in {case.status.value} for more than 30 minutes"}
+        )
+        reconfigured += 1
+        
+    db.commit()
+    return {"status": "success", "processed": reconfigured}

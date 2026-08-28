@@ -193,3 +193,32 @@ class HumanReviewRequest(BaseModel):
     action: str
     operator_id: str
     notes: Optional[str] = None
+
+
+class MerchantPolicyCreate(BaseModel):
+    merchant_id: str
+    max_attempts: int
+    retry_backoff: int
+    amount_threshold: float
+    allowed_actions: List[str] = []
+    human_review_threshold: float = 70.0
+    risk_threshold: float = 80.0
+    cooldown: int = 3600
+    enabled: bool = True
+
+
+class MerchantPolicyResponse(BaseModel):
+    id: str
+    merchant_id: str
+    max_attempts: int
+    retry_backoff: int
+    amount_threshold: float
+    allowed_actions: List[str]
+    human_review_threshold: float
+    risk_threshold: float
+    cooldown: int
+    enabled: bool
+    version: int
+
+    class Config:
+        from_attributes = True
