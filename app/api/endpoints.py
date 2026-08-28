@@ -90,6 +90,16 @@ def verify_api_key(
     )
 
 
+
+def resolve_optional_api_key(
+    x_api_key: Optional[str] = Header(None),
+    x_merchant_id: Optional[str] = Header(None)
+) -> Optional[str]:
+    if not x_api_key:
+        return None
+    return verify_api_key(x_api_key, x_merchant_id)
+
+
 # Helper function to redact raw secrets/keys recursively
 def redact_secrets(val: Any) -> Any:
     if isinstance(val, dict):
@@ -263,7 +273,7 @@ def ingest_payment_event(payload: PaymentEventIngest, db: Session = Depends(get_
 
 
 @router.get("/api/metrics", response_model=MetricsResponse)
-def get_metrics(db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+def get_metrics(db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(resolve_optional_api_key)):
     cache_key = f"metrics_data:{merchant_id or 'global'}"
     cached_metrics = RedisCache.get(cache_key)
     if cached_metrics:
@@ -396,7 +406,7 @@ def list_cases(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
-    merchant_id: Optional[str] = Depends(verify_api_key)
+    merchant_id: Optional[str] = Depends(resolve_optional_api_key)
 ):
     # Read-Only Endpoint
     query = db.query(RecoveryCase).join(PaymentEvent)
@@ -482,7 +492,7 @@ def list_cases(
 
 
 @router.get("/api/cases/{case_id}", response_model=CaseDetail)
-def get_case(case_id: str, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+def get_case(case_id: str, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(resolve_optional_api_key)):
     # Read-Only Endpoint
     c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
     if not c:
