@@ -2,10 +2,22 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.endpoints import router as api_router
-from app.db.session import engine, Base
+from alembic.config import Config
+from alembic import command
+import os
 
-# Create tables in the db engine on application startup
-Base.metadata.create_all(bind=engine)
+# Create tables in the db engine on application startup using Alembic migrations
+try:
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ini_path = os.path.join(base_dir, "alembic.ini")
+    alembic_cfg = Config(ini_path)
+    alembic_cfg.set_main_option("script_location", os.path.join(base_dir, "migrations"))
+    command.upgrade(alembic_cfg, "head")
+    print("Alembic: Database upgrade completed successfully.")
+except Exception as e:
+    print(f"Alembic startup migration warning: {e}. Falling back to metadata.create_all.")
+    from app.db.session import engine, Base
+    Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="RecoverAI Backend API",

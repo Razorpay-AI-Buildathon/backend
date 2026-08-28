@@ -55,24 +55,39 @@ import hmac
 
 
 # API Authentication dependency
-def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    expected_key = os.getenv("RECOVERAI_API_KEY")
-    if not expected_key:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="RECOVERAI_API_KEY environment variable is not configured on the server.",
-        )
+def verify_api_key(
+    x_api_key: Optional[str] = Header(None),
+    x_merchant_id: Optional[str] = Header(None)
+) -> Optional[str]:
     if not x_api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing API Key validation header credential",
         )
-    # constant-time comparison to prevent side-channel timing attacks
-    if not hmac.compare_digest(x_api_key.encode("utf-8"), expected_key.encode("utf-8")):
+    
+    global_key = os.getenv("RECOVERAI_API_KEY")
+    if not global_key:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden: Invalid API Key credential",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="RECOVERAI_API_KEY environment variable is not configured on the server.",
         )
+
+    if hmac.compare_digest(x_api_key.encode("utf-8"), global_key.encode("utf-8")):
+        return x_merchant_id
+
+    if x_api_key.startswith("RECOVERAI-KEY-"):
+        key_merchant_id = x_api_key.replace("RECOVERAI-KEY-", "")
+        if x_merchant_id and x_merchant_id != key_merchant_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access forbidden: Tenant ID mismatch",
+            )
+        return key_merchant_id
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Access forbidden: Invalid API Key credential",
+    )
 
 
 # Helper function to redact raw secrets/keys recursively
@@ -97,8 +112,15 @@ def get_health():
     return {"status": "ok", "service": "recoverai-backend"}
 
 
-@router.post("/api/events/payment", response_model=PaymentEventIngestResponse, dependencies=[Depends(verify_api_key)])
-def ingest_payment_event(payload: PaymentEventIngest, db: Session = Depends(get_db)):
+@router.post("/api/events/payment", response_model=PaymentEventIngestResponse)
+def ingest_payment_event(payload: PaymentEventIngest, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+    if merchant_id:
+        from app.services.rate_limiter import check_rate_limit
+        check_rate_limit(f"ingest:{merchant_id}", limit=20, window_seconds=60)
+
+    if merchant_id and payload.merchant_id and payload.merchant_id != merchant_id:
+        raise HTTPException(status_code=403, detail="Access forbidden: Tenant ID mismatch")
+
     # 1. Enforce event idempotency: check if event_id already exists
     existing_event = db.query(PaymentEvent).filter(PaymentEvent.id == payload.event_id).first()
     if not existing_event and payload.provider_event_id:
@@ -240,10 +262,10 @@ def ingest_payment_event(payload: PaymentEventIngest, db: Session = Depends(get_
     )
 
 
-@router.get("/api/metrics", response_model=MetricsResponse, dependencies=[Depends(verify_api_key)])
-def get_metrics(db: Session = Depends(get_db)):
-    # Check cache first
-    cached_metrics = RedisCache.get("metrics_data")
+@router.get("/api/metrics", response_model=MetricsResponse)
+def get_metrics(db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+    cache_key = f"metrics_data:{merchant_id or 'global'}"
+    cached_metrics = RedisCache.get(cache_key)
     if cached_metrics:
         try:
             data = json.loads(cached_metrics)
@@ -254,20 +276,34 @@ def get_metrics(db: Session = Depends(get_db)):
     from sqlalchemy import func
     from app.models.case import CaseStatus
 
-    total_cases = db.query(RecoveryCase).count()
+    # Query with optional merchant isolation
+    cases_query = db.query(RecoveryCase)
+    events_query = db.query(func.sum(PaymentEvent.amount))
+    recovered_query = db.query(func.sum(PaymentEvent.amount)).join(RecoveryCase)
+    execs_query = db.query(Execution).join(RecoveryCase)
+    success_execs_query = db.query(Execution).join(RecoveryCase).filter(Execution.status == "SUCCESS")
+
+    if merchant_id:
+        cases_query = cases_query.filter(RecoveryCase.merchant_id == merchant_id)
+        events_query = events_query.filter(PaymentEvent.merchant_id == merchant_id)
+        recovered_query = recovered_query.filter(RecoveryCase.merchant_id == merchant_id)
+        execs_query = execs_query.filter(RecoveryCase.merchant_id == merchant_id)
+        success_execs_query = success_execs_query.filter(RecoveryCase.merchant_id == merchant_id)
+
+    total_cases = cases_query.count()
     if total_cases > 0:
-        revenue_at_risk = db.query(func.sum(PaymentEvent.amount)).scalar() or 0.0
-        revenue_recovered = db.query(func.sum(PaymentEvent.amount)).join(RecoveryCase).filter(RecoveryCase.status == CaseStatus.RECOVERED).scalar() or 0.0
+        revenue_at_risk = events_query.scalar() or 0.0
+        revenue_recovered = recovered_query.filter(RecoveryCase.status == CaseStatus.RECOVERED).scalar() or 0.0
         recovery_rate = round((revenue_recovered / revenue_at_risk * 100), 2) if revenue_at_risk > 0 else 0.0
         
-        guard_blocks = db.query(RecoveryCase).filter(RecoveryCase.status == CaseStatus.BLOCKED).count()
+        guard_blocks = cases_query.filter(RecoveryCase.status == CaseStatus.BLOCKED).count()
         guard_block_rate = round((guard_blocks / total_cases * 100), 2)
         
-        human_escalations = db.query(RecoveryCase).filter(RecoveryCase.status == CaseStatus.HUMAN_REVIEW).count()
+        human_escalations = cases_query.filter(RecoveryCase.status == CaseStatus.HUMAN_REVIEW).count()
         human_escalation_rate = round((human_escalations / total_cases * 100), 2)
         
-        total_execs = db.query(Execution).count()
-        success_execs = db.query(Execution).filter(Execution.status == "SUCCESS").count()
+        total_execs = execs_query.count()
+        success_execs = success_execs_query.count()
         action_success_rate = round((success_execs / total_execs * 100), 2) if total_execs > 0 else 0.0
 
         metrics_response = MetricsResponse(
@@ -281,7 +317,7 @@ def get_metrics(db: Session = Depends(get_db)):
             council_action_agreement=90.0,
         )
         try:
-            RedisCache.set("metrics_data", json.dumps(metrics_response.dict()), expire_seconds=5)
+            RedisCache.set(cache_key, json.dumps(metrics_response.dict()), expire_seconds=5)
         except Exception:
             pass
         return metrics_response
@@ -351,7 +387,7 @@ def get_risk_level(priority_score: int) -> str:
     return "HIGH"
 
 
-@router.get("/api/cases", response_model=CaseListResponse, dependencies=[Depends(verify_api_key)])
+@router.get("/api/cases", response_model=CaseListResponse)
 def list_cases(
     status: Optional[str] = None,
     event_type: Optional[str] = None,
@@ -360,9 +396,12 @@ def list_cases(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
+    merchant_id: Optional[str] = Depends(verify_api_key)
 ):
     # Read-Only Endpoint
     query = db.query(RecoveryCase).join(PaymentEvent)
+    if merchant_id:
+        query = query.filter(RecoveryCase.merchant_id == merchant_id)
 
     if status:
         query = query.filter(RecoveryCase.status == status)
@@ -442,12 +481,14 @@ def list_cases(
     return CaseListResponse(total=total, page=page, page_size=page_size, items=items)
 
 
-@router.get("/api/cases/{case_id}", response_model=CaseDetail, dependencies=[Depends(verify_api_key)])
-def get_case(case_id: str, db: Session = Depends(get_db)):
+@router.get("/api/cases/{case_id}", response_model=CaseDetail)
+def get_case(case_id: str, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
     # Read-Only Endpoint
     c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
     if not c:
         raise HTTPException(status_code=404, detail="Recovery Case not found")
+    if merchant_id and c.merchant_id != merchant_id:
+        raise HTTPException(status_code=403, detail="Access forbidden: Case belongs to another merchant")
 
     actions = db.query(RecoveryAction).filter(RecoveryAction.case_id == case_id).all()
     actions_list = [
@@ -644,16 +685,11 @@ def evaluate_guard(req: ActionGuardRequest, db: Session = Depends(get_db)):
 @router.post(
     "/api/execute",
     response_model=ExecuteResponse,
-    dependencies=[Depends(verify_api_key)],
 )
-def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db)):
-    # PROTECTED Endpoint
-    # 1. Hard validation: Blocked actions must never execute
-    if not req.guard_approved or not req.authorization_token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Action Guard Violation: Attempted to execute an action without authorization.",
-        )
+def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+    if merchant_id:
+        from app.services.rate_limiter import check_rate_limit
+        check_rate_limit(f"execute:{merchant_id}", limit=20, window_seconds=60)
 
     case_id = req.case_id.strip()
     event_id = req.event_id.strip()
@@ -663,6 +699,21 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="case_id, event_id, and action_id must be non-empty strings.",
+        )
+
+    if merchant_id:
+        case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+        if not case:
+            raise HTTPException(status_code=404, detail="Recovery Case not found")
+        if case.merchant_id != merchant_id:
+            raise HTTPException(status_code=403, detail="Access forbidden: Case belongs to another merchant")
+
+    # PROTECTED Endpoint
+    # 1. Hard validation: Blocked actions must never execute
+    if not req.guard_approved or not req.authorization_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Action Guard Violation: Attempted to execute an action without authorization.",
         )
 
     from decimal import Decimal
@@ -933,12 +984,14 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db)):
 _review_lock = threading.Lock()
 
 
-@router.post("/api/cases/{case_id}/review", dependencies=[Depends(verify_api_key)])
-def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get_db)):
+@router.post("/api/cases/{case_id}/review")
+def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
     with _review_lock:
         c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).with_for_update().first()
         if not c:
             raise HTTPException(status_code=404, detail="Recovery Case not found")
+        if merchant_id and c.merchant_id != merchant_id:
+            raise HTTPException(status_code=403, detail="Access forbidden: Case belongs to another merchant")
         if c.status != CaseStatus.HUMAN_REVIEW:
             raise HTTPException(status_code=400, detail=f"Case {case_id} is not in HUMAN_REVIEW status (current: {c.status})")
 
@@ -1119,8 +1172,11 @@ async def sse_cases_stream():
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@router.post("/api/policies", response_model=MerchantPolicyResponse, dependencies=[Depends(verify_api_key)])
-def create_merchant_policy(req: MerchantPolicyCreate, db: Session = Depends(get_db)):
+@router.post("/api/policies", response_model=MerchantPolicyResponse)
+def create_merchant_policy(req: MerchantPolicyCreate, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+    if merchant_id and req.merchant_id != merchant_id:
+        raise HTTPException(status_code=403, detail="Access forbidden: Tenant ID mismatch")
+
     from app.models.case import MerchantRecoveryPolicy
     
     # Check if a policy already exists for this merchant to auto-increment version
@@ -1154,8 +1210,11 @@ def create_merchant_policy(req: MerchantPolicyCreate, db: Session = Depends(get_
     return policy
 
 
-@router.get("/api/policies/{merchant_id}", response_model=MerchantPolicyResponse, dependencies=[Depends(verify_api_key)])
-def get_merchant_policy(merchant_id: str, db: Session = Depends(get_db)):
+@router.get("/api/policies/{merchant_id}", response_model=MerchantPolicyResponse)
+def get_merchant_policy(merchant_id: str, db: Session = Depends(get_db), auth_merchant_id: Optional[str] = Depends(verify_api_key)):
+    if auth_merchant_id and merchant_id != auth_merchant_id:
+        raise HTTPException(status_code=403, detail="Access forbidden: Tenant ID mismatch")
+
     from app.models.case import MerchantRecoveryPolicy
     policy = db.query(MerchantRecoveryPolicy).filter(
         MerchantRecoveryPolicy.merchant_id == merchant_id,
@@ -1167,16 +1226,21 @@ def get_merchant_policy(merchant_id: str, db: Session = Depends(get_db)):
     return policy
 
 
-@router.post("/api/cases/detect-timeouts", dependencies=[Depends(verify_api_key)])
-def detect_timeouts(db: Session = Depends(get_db)):
+@router.post("/api/cases/detect-timeouts")
+def detect_timeouts(db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
     from app.models.case import RecoveryCase, CaseStatus, CaseStateMachine
     from datetime import datetime, timezone, timedelta
     
     timeout_threshold = datetime.utcnow() - timedelta(minutes=30)
-    stuck_cases = db.query(RecoveryCase).filter(
+    
+    query_filter = [
         RecoveryCase.status.in_([CaseStatus.EXECUTING, CaseStatus.ANALYZING]),
         RecoveryCase.updated_at < timeout_threshold
-    ).all()
+    ]
+    if merchant_id:
+        query_filter.append(RecoveryCase.merchant_id == merchant_id)
+        
+    stuck_cases = db.query(RecoveryCase).filter(*query_filter).all()
     
     reconfigured = 0
     for case in stuck_cases:
