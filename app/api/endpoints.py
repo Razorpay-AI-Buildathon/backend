@@ -1083,71 +1083,82 @@ def handle_provider_webhook(
 ):
     event_name = req.get("event")
     event_id = req.get("provider_event_id") or req.get("id") or f"evt_{uuid.uuid4().hex[:12]}"
-    
-    webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
-    if x_razorpay_signature:
-        if x_razorpay_signature != "test_signature" and webhook_secret:
-            import hmac
-            import hashlib
-            body_bytes = json.dumps(req, sort_keys=True).encode("utf-8")
-            expected = hmac.new(webhook_secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(expected, x_razorpay_signature):
-                raise HTTPException(status_code=400, detail="Invalid signature")
 
-    from app.models.case import WebhookEvent
-    existing_webhook = db.query(WebhookEvent).filter(WebhookEvent.provider_event_id == event_id).first()
-    if existing_webhook:
-        return {"status": "success", "message": "Webhook already processed (idempotent)"}
+    from app.services.redis_cache import RedisLock
+    lock = RedisLock(f"webhook_processing:{event_id}", expire_seconds=15)
+    if not lock.__enter__():
+        raise HTTPException(status_code=409, detail="Webhook is currently being processed by another worker")
 
-    webhook_evt = WebhookEvent(
-        provider_event_id=event_id,
-        payload=req,
-        processed_at=datetime.utcnow()
-    )
-    db.add(webhook_evt)
+    try:
+        webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+        if x_razorpay_signature:
+            if x_razorpay_signature != "test_signature" and webhook_secret:
+                import hmac
+                import hashlib
+                body_bytes = json.dumps(req, sort_keys=True).encode("utf-8")
+                expected = hmac.new(webhook_secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(expected, x_razorpay_signature):
+                    raise HTTPException(status_code=400, detail="Invalid signature")
 
-    payment_data = req.get("payload", {}).get("payment", {}).get("entity", {})
-    payment_id = payment_data.get("id") or req.get("payment_id")
-    payment_status = payment_data.get("status") or req.get("status")
-    
-    if not payment_id:
-        payment_id = req.get("id")
-    
-    if not payment_id:
-        db.commit()
-        return {"status": "success", "message": "No payment identifier found in webhook"}
+        from app.models.case import WebhookEvent
+        existing_webhook = db.query(WebhookEvent).filter(WebhookEvent.provider_event_id == event_id).first()
+        if existing_webhook:
+            return {"status": "success", "message": "Webhook already processed (idempotent)"}
 
-    execution = db.query(Execution).filter(Execution.provider_reference == payment_id).first()
-    if not execution:
-        db.commit()
-        return {"status": "success", "message": "No matching active execution found for this payment reference"}
+        webhook_evt = WebhookEvent(
+            provider_event_id=event_id,
+            payload=req,
+            processed_at=datetime.utcnow()
+        )
+        db.add(webhook_evt)
 
-    case = db.query(RecoveryCase).filter(RecoveryCase.id == execution.case_id).first()
-    if not case:
-        db.commit()
-        return {"status": "success", "message": "Matching execution found but no case associated"}
-
-    # Concurrency Row Locking (Task 24)
-    db.query(RecoveryCase).filter(RecoveryCase.id == case.id).with_for_update().first()
-
-    if payment_status in ("captured", "success", "SUCCESS"):
-        execution.status = "SUCCESS"
-        execution.completed_at = datetime.utcnow()
-        CaseStateMachine.transition_status(db, case, CaseStatus.RECOVERED, "webhook_reconciled_success", "SYSTEM", {"execution_id": execution.id})
-    elif payment_status in ("failed", "FAILED"):
-        execution.status = "FAILED"
-        execution.completed_at = datetime.utcnow()
-        CaseStateMachine.transition_status(db, case, CaseStatus.FAILED, "webhook_reconciled_failed", "SYSTEM", {"execution_id": execution.id})
+        payment_data = req.get("payload", {}).get("payment", {}).get("entity", {})
+        payment_id = payment_data.get("id") or req.get("payment_id")
+        payment_status = payment_data.get("status") or req.get("status")
         
-        from app.services.queue import RedisQueue
-        try:
-            RedisQueue().enqueue("evaluate_case", {"case_id": case.id})
-        except Exception as e:
-            print(f"Webhook Queue Warning: Failed to enqueue evaluate_case: {e}")
+        if not payment_id:
+            payment_id = req.get("id")
+        
+        if not payment_id:
+            db.commit()
+            return {"status": "success", "message": "No payment identifier found in webhook"}
 
-    db.commit()
-    RedisCache.delete("metrics_data")
-    return {"status": "success", "message": f"Webhook processed, Case transitioned to {case.status.value}"}
+        execution = db.query(Execution).filter(Execution.provider_reference == payment_id).first()
+        if not execution:
+            db.commit()
+            return {"status": "success", "message": "No matching active execution found for this payment reference"}
+
+        case = db.query(RecoveryCase).filter(RecoveryCase.id == execution.case_id).first()
+        if not case:
+            db.commit()
+            return {"status": "success", "message": "Matching execution found but no case associated"}
+
+        # Concurrency Row Locking (Task 24)
+        db.query(RecoveryCase).filter(RecoveryCase.id == case.id).with_for_update().first()
+
+        if payment_status in ("captured", "success", "SUCCESS"):
+            execution.status = "SUCCESS"
+            execution.completed_at = datetime.utcnow()
+            CaseStateMachine.transition_status(db, case, CaseStatus.RECOVERED, "webhook_reconciled_success", "SYSTEM", {"execution_id": execution.id})
+        elif payment_status in ("failed", "FAILED"):
+            execution.status = "FAILED"
+            execution.completed_at = datetime.utcnow()
+            CaseStateMachine.transition_status(db, case, CaseStatus.FAILED, "webhook_reconciled_failed", "SYSTEM", {"execution_id": execution.id})
+            
+            from app.services.queue import RedisQueue
+            try:
+                RedisQueue().enqueue("evaluate_case", {"case_id": case.id})
+            except Exception as e:
+                print(f"Webhook Queue Warning: Failed to enqueue evaluate_case: {e}")
+
+        db.commit()
+        RedisCache.delete("metrics_data")
+        return {"status": "success", "message": f"Webhook processed, Case transitioned to {case.status.value}"}
+    finally:
+        try:
+            lock.__exit__(None, None, None)
+        except Exception as le:
+            print(f"Webhook Lock Release Error: {le}")
 
 
 @router.get("/api/cases/stream")

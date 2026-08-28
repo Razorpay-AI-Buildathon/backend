@@ -62,6 +62,12 @@ class RecoveryWorker:
             db.close()
 
     def process_case_evaluation(self, case_id: str):
+        from app.services.redis_cache import RedisLock
+        self.lock = RedisLock(f"case_evaluation:{case_id}", expire_seconds=30)
+        if not self.lock.__enter__():
+            print(f"RecoveryWorker: Case {case_id} is currently locked by another worker.")
+            return
+
         db = SessionLocal()
         try:
             case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
@@ -253,3 +259,7 @@ class RecoveryWorker:
             print(f"RecoveryWorker: DB Error processing case {case_id}: {e}")
         finally:
             db.close()
+            try:
+                self.lock.__exit__(None, None, None)
+            except Exception as le:
+                print(f"RecoveryWorker: Error releasing lock: {le}")
