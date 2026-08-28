@@ -188,6 +188,35 @@ class MetricsResponse(BaseModel):
     backend_action_agreement: Optional[float] = None
     council_action_agreement: Optional[float] = None
 
+    # Task 17 Evaluation & BI Metrics
+    # Financial
+    recovered_value_per_attempt: float = 0.0
+    # Operational
+    avg_attempts: float = 0.0
+    avg_recovery_time_seconds: float = 0.0
+    execution_failure_rate: float = 0.0
+    # AI
+    council_confidence: float = 0.0
+    proposal_acceptance_rate: float = 0.0
+    replan_rate: float = 0.0
+    guard_override_rate: float = 0.0
+    # Strategy mappings
+    recovery_by_action_type: Dict[str, float] = {}
+    recovery_by_failure_code: Dict[str, float] = {}
+    recovery_by_customer_risk_band: Dict[str, float] = {}
+    recovery_by_amount_band: Dict[str, float] = {}
+    recovery_by_merchant: Dict[str, float] = {}
+
+    # Task 36 Reconciled metrics
+    reconciled_revenue_recovered: float = 0.0
+    reconciled_recovery_rate: float = 0.0
+
+    # Task 37 A/B Experiment metrics
+    control_recovery_rate: float = 0.0
+    treatment_recovery_rate: float = 0.0
+    control_revenue_recovered: float = 0.0
+    treatment_revenue_recovered: float = 0.0
+
 
 class HumanReviewRequest(BaseModel):
     action: str

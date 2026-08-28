@@ -138,17 +138,29 @@ class RecoveryWorker:
                 "failed_actions": failed_actions
             }
 
-            try:
-                resp = httpx.post(f"{ai_service_url}/analyze-event", json=state_input, timeout=10.0)
-                if resp.status_code != 200:
-                    raise Exception(f"AI Service HTTP error {resp.status_code}")
-                ai_data = resp.json()
-            except Exception as e:
-                # Task 28: AI Failure Isolation Fallback (Escalate to Human Operator)
-                print(f"RecoveryWorker: AI Service call failed: {e}. Escalating to human operator.")
-                CaseStateMachine.transition_status(db, case, CaseStatus.HUMAN_REVIEW, "ai_service_failure", "SYSTEM", {"error": str(e)})
-                db.commit()
-                return
+            if case.experiment_group == "CONTROL":
+                ai_data = {
+                    "final_action": "RETRY_PAYMENT",
+                    "final_confidence": 1.0,
+                    "action_id": f"act-{uuid.uuid4().hex[:12]}",
+                    "model": "control_default",
+                    "model_version": "v1.0",
+                    "prompt_version": "control",
+                    "strategy_version": "control",
+                    "playbook_version": "control"
+                }
+            else:
+                try:
+                    resp = httpx.post(f"{ai_service_url}/analyze-event", json=state_input, timeout=10.0)
+                    if resp.status_code != 200:
+                        raise Exception(f"AI Service HTTP error {resp.status_code}")
+                    ai_data = resp.json()
+                except Exception as e:
+                    # Task 28: AI Failure Isolation Fallback (Escalate to Human Operator)
+                    print(f"RecoveryWorker: AI Service call failed: {e}. Escalating to human operator.")
+                    CaseStateMachine.transition_status(db, case, CaseStatus.HUMAN_REVIEW, "ai_service_failure", "SYSTEM", {"error": str(e)})
+                    db.commit()
+                    return
 
             proposed_action = ai_data.get("final_action", "DO_NOTHING")
             confidence = ai_data.get("final_confidence", 0.70)
@@ -216,6 +228,37 @@ class RecoveryWorker:
                     event_id=event.id,
                     action_id=action_id
                 )
+
+                from app.models.case import RecoveryAction, Execution, ActionState
+                
+                db_action = RecoveryAction(
+                    id=action_id,
+                    case_id=case.id,
+                    action_type=proposed_action,
+                    proposed_by="AI_PLANNER" if case.experiment_group == "TREATMENT" else "CONTROL_STRATEGY",
+                    state=ActionState.APPROVED_BY_GUARD,
+                    authorization_token=token,
+                    action_id=action_id,
+                    execution_id=res["execution_id"]
+                )
+                db.add(db_action)
+                db.flush()
+
+                execution = Execution(
+                    id=res["execution_id"],
+                    action_id=db_action.id,
+                    case_id=case.id,
+                    status=res["status"],
+                    provider="razorpay",
+                    provider_reference=res["execution_id"],
+                    amount=event.amount,
+                    currency=event.currency,
+                    attempted_at=datetime.utcnow(),
+                    completed_at=datetime.utcnow() if res["status"] == "SUCCESS" else None,
+                    result_code=None,
+                    failure_reason=res["message"]
+                )
+                db.add(execution)
 
                 target_state = CaseStatus.RECOVERED if res["recovered"] else CaseStatus.FAILED
                 CaseStateMachine.transition_status(db, case, target_state, "worker_execution_result", "SYSTEM", {"execution_id": res["execution_id"]})

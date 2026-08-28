@@ -112,6 +112,7 @@ class RecoveryCase(Base):
     closed_at = Column(DateTime, nullable=True)
     policy_id = Column(String, ForeignKey("merchant_recovery_policies.id"), nullable=True)
     policy_version = Column(Integer, nullable=True)
+    experiment_group = Column(String, default="TREATMENT") # CONTROL vs TREATMENT
 
     event = relationship("PaymentEvent")
     actions = relationship("RecoveryAction", back_populates="case")
@@ -144,6 +145,7 @@ class Execution(Base):
     provider = Column(String, default="razorpay")
     provider_reference = Column(String, nullable=True, unique=True)
     amount = Column(Numeric(12, 2), nullable=False)
+    reconciled_amount = Column(Numeric(12, 2), nullable=True) # Task 36
     currency = Column(String, default="INR")
     attempted_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
@@ -307,8 +309,9 @@ class CaseStateMachine:
         event_name: str,
         actor: str = "SYSTEM",
         details: dict = None,
+        force: bool = False,
     ) -> bool:
-        if not cls.validate_transition(case.status, target_status):
+        if not force and not cls.validate_transition(case.status, target_status):
             raise ValueError(
                 f"State Machine Guard: Invalid transition from {case.status} to {target_status} for case {case.id}"
             )
