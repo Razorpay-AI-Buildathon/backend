@@ -70,13 +70,25 @@ class RecoveryWorker:
 
         db = SessionLocal()
         try:
-            case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+            from sqlalchemy import text
+            if db.bind.dialect.name == "sqlite":
+                db.execute(text("BEGIN IMMEDIATE"))
+            case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).with_for_update().first()
             if not case:
                 print(f"RecoveryWorker: Case {case_id} not found in database.")
                 return
 
             if case.status not in (CaseStatus.IDENTIFIED, CaseStatus.ANALYZING):
                 print(f"RecoveryWorker: Case {case_id} is in status {case.status}, not ready for evaluation.")
+                return
+
+            from app.models.case import Execution
+            active_execution = db.query(Execution).filter(
+                Execution.case_id == case_id,
+                Execution.status.in_(["SUCCESS", "PENDING"])
+            ).first()
+            if active_execution:
+                print(f"RecoveryWorker: Active execution found for case {case_id}. Aborting evaluation.")
                 return
 
             event = db.query(PaymentEvent).filter(PaymentEvent.id == case.event_id).first()
