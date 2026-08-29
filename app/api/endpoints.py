@@ -1020,21 +1020,26 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db), 
 
         # Update case execution status final outcomes
         if c:
-            target_state = (
-                CaseStatus.RECOVERED if res["recovered"] else CaseStatus.FAILED
-            )
-            try:
-                CaseStateMachine.transition_status(
-                    db,
-                    c,
-                    target_state,
-                    "execution_result",
-                    "API_SIMULATION",
-                    {"execution_id": res["execution_id"]}
+            is_payment_action = (req.action_type.value in ("RETRY_PAYMENT", "RETRY")) and res.get("async_reconciliation", False)
+            if is_payment_action:
+                target_state = CaseStatus.EXECUTING
+            else:
+                target_state = (
+                    CaseStatus.RECOVERED if res["recovered"] else CaseStatus.FAILED
                 )
+            try:
+                if c.status != target_state:
+                    CaseStateMachine.transition_status(
+                        db,
+                        c,
+                        target_state,
+                        "execution_result",
+                        "API_SIMULATION",
+                        {"execution_id": res["execution_id"]}
+                    )
 
-                # Retry & Replanning Engine logic
-                if target_state == CaseStatus.FAILED:
+                # Retry & Replanning Engine logic (only for synchronous failed non-payment actions)
+                if not is_payment_action and target_state == CaseStatus.FAILED:
                     c.current_recovery_attempt += 1
                     if c.current_recovery_attempt >= c.max_attempts:
                         # Policy limits exceeded: FAILED -> CLOSED
@@ -1050,9 +1055,12 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db), 
                 raise HTTPException(status_code=400, detail=str(ve))
 
             # Update corresponding RecoveryAction state and execution_id in database
-            act_state = (
-                ActionState.SUCCESSFUL if res["recovered"] else ActionState.FAILED
-            )
+            if is_payment_action:
+                act_state = ActionState.EXECUTED
+            else:
+                act_state = (
+                    ActionState.SUCCESSFUL if res["recovered"] else ActionState.FAILED
+                )
             db_act = (
                 db.query(RecoveryAction)
                 .filter(
@@ -1066,19 +1074,20 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db), 
                 db_act.execution_id = res["execution_id"]
 
             # Persist Execution record to database
+            exec_status = "PENDING" if is_payment_action else ("SUCCESS" if res["recovered"] else "FAILED")
             execution_db = Execution(
                 id=res["execution_id"],
                 action_id=db_act.id if db_act else None,
                 case_id=case_id,
-                status="SUCCESS" if res["recovered"] else "FAILED",
+                status=exec_status,
                 provider="razorpay",
                 provider_reference=res["execution_id"],
                 amount=req.amount,
                 currency=req.currency,
                 attempted_at=datetime.utcnow(),
-                completed_at=datetime.utcnow(),
+                completed_at=None if exec_status == "PENDING" else datetime.utcnow(),
                 result_code=res["status"],
-                failure_reason=None if res["recovered"] else res["message"],
+                failure_reason=None if res["recovered"] or exec_status == "PENDING" else res["message"],
                 metadata_json={
                     "token_used": req.authorization_token[:15] + "...",
                     "action_id": action_id

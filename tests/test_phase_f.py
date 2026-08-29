@@ -165,3 +165,101 @@ def test_complete_e2e_flow_with_reconciliation(setup_db, monkeypatch):
     metrics = resp.json()
     assert metrics["reconciled_revenue_recovered"] == 2500.0
     assert metrics["reconciled_recovery_rate"] == 100.0
+
+
+def test_async_webhook_reconciliation_flow(setup_db, monkeypatch):
+    db_session = setup_db
+
+    # 1. Ingest payment event
+    payload = {
+        "event_id": "evt_async_recon",
+        "merchant_id": "merch_async",
+        "customer_id": "cust_async",
+        "event_type": "FAILED_PAYMENT",
+        "amount": 1200.0,
+        "currency": "INR"
+    }
+    resp = client.post("/api/events/payment", json=payload, headers=auth_headers)
+    assert resp.status_code == 200
+    case_id = resp.json()["case_id"]
+
+    # Transition case to ACTION_PROPOSED so it is allowed to enter GUARD_REVIEW
+    from app.models.case import CaseStateMachine
+    c_obj = db_session.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    CaseStateMachine.transition_status(db_session, c_obj, CaseStatus.ANALYZING, "analyze", "SYSTEM")
+    CaseStateMachine.transition_status(db_session, c_obj, CaseStatus.ACTION_PROPOSED, "propose", "SYSTEM")
+    db_session.commit()
+
+    # 2. Get action guard authorization token
+    payload_eval = {
+        "action_type": "RETRY_PAYMENT",
+        "amount": 1200.0,
+        "currency": "INR",
+        "current_attempts": 0,
+        "max_retries": 3,
+        "case_id": case_id,
+        "event_id": "evt_async_recon",
+        "action_id": "act_async_recon"
+    }
+    resp_eval = client.post("/api/action-guard/evaluate", json=payload_eval, headers=auth_headers)
+    assert resp_eval.status_code == 200
+    token = resp_eval.json()["authorization_token"]
+
+    # 3. Call execute with async_reconciliation = True in ground_truth
+    exec_payload = {
+        "action_type": "RETRY_PAYMENT",
+        "amount": 1200.0,
+        "currency": "INR",
+        "authorization_token": token,
+        "guard_approved": True,
+        "case_id": case_id,
+        "event_id": "evt_async_recon",
+        "action_id": "act_async_recon",
+        "ground_truth": {
+            "action_success": True,
+            "async_reconciliation": True
+        }
+    }
+    resp_exec = client.post("/api/execute", json=exec_payload, headers=auth_headers)
+    assert resp_exec.status_code == 200
+    exec_id = resp_exec.json()["execution_id"]
+
+    # Assert that execution is PENDING, and case is EXECUTING (not RECOVERED yet!)
+    db_session.expire_all()
+    c = db_session.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    assert c.status == CaseStatus.EXECUTING
+
+    exec_obj = db_session.query(Execution).filter(Execution.id == exec_id).first()
+    assert exec_obj.status == "PENDING"
+    assert exec_obj.completed_at is None
+
+    # 4. Ingest provider webhook SUCCESS
+    webhook_payload = {
+        "event": "payment.captured",
+        "provider_event_id": "web_evt_async_1",
+        "payload": {
+            "payment": {
+                "entity": {
+                    "id": exec_id,
+                    "status": "captured",
+                    "amount": 120000
+                }
+            }
+        }
+    }
+    resp_web1 = client.post("/api/webhooks/provider", json=webhook_payload, headers={"X-Razorpay-Signature": "test_sig"})
+    assert resp_web1.status_code == 200
+
+    # Verify transition to RECOVERED and execution to SUCCESS
+    db_session.expire_all()
+    c = db_session.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    assert c.status == CaseStatus.RECOVERED
+
+    exec_obj = db_session.query(Execution).filter(Execution.id == exec_id).first()
+    assert exec_obj.status == "SUCCESS"
+    assert exec_obj.reconciled_amount == 1200.0
+
+    # 5. Ingest duplicate provider webhook SUCCESS
+    resp_web2 = client.post("/api/webhooks/provider", json=webhook_payload, headers={"X-Razorpay-Signature": "test_sig"})
+    assert resp_web2.status_code == 200
+    assert "already processed" in resp_web2.json()["message"]

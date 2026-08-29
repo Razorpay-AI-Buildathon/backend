@@ -73,6 +73,7 @@ class ExecutionSimulator:
                 "recovered_amount": result.recovered_amount,
                 "message": result.failure_reason or "Execution completed",
                 "executed_at": datetime.now(timezone.utc).isoformat(),
+                "async_reconciliation": result.async_reconciliation
             }
 
             # Persist execution result in canonical registry

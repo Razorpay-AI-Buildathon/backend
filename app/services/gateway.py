@@ -12,7 +12,8 @@ class PaymentGatewayResult:
         result_code: str,
         failure_reason: Optional[str] = None,
         recovered_amount: Decimal = Decimal("0.00"),
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        async_reconciliation: bool = False
     ):
         self.success = success
         self.recovered = recovered
@@ -21,6 +22,7 @@ class PaymentGatewayResult:
         self.failure_reason = failure_reason
         self.recovered_amount = recovered_amount
         self.metadata = metadata or {}
+        self.async_reconciliation = async_reconciliation
 
 class PaymentGateway(ABC):
     @abstractmethod
@@ -80,13 +82,15 @@ class SimulatedPaymentGateway(PaymentGateway):
                 recovered_amount = Decimal(str(ground_truth.get("recovered_amount", amount)))
                 reason = f"Payment recovery successful via strategy: {action_type}"
 
+        async_reconcile = ground_truth.get("async_reconciliation", False) if ground_truth else False
         return PaymentGatewayResult(
             success=action_success,
             recovered=action_success,
             provider_reference=provider_ref,
             result_code="SUCCESS" if action_success else "DECLINED",
             failure_reason=reason,
-            recovered_amount=recovered_amount
+            recovered_amount=recovered_amount,
+            async_reconciliation=async_reconcile
         )
 
 class RazorpayPaymentGateway(PaymentGateway):

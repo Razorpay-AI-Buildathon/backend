@@ -248,7 +248,7 @@ class RecoveryWorker:
                     case_id=case.id,
                     action_type=proposed_action,
                     proposed_by="AI_PLANNER" if case.experiment_group == "TREATMENT" else "CONTROL_STRATEGY",
-                    state=ActionState.APPROVED_BY_GUARD,
+                    state=ActionState.EXECUTED if proposed_action in ("RETRY_PAYMENT", "RETRY") else ActionState.APPROVED_BY_GUARD,
                     authorization_token=token,
                     action_id=action_id,
                     execution_id=res["execution_id"]
@@ -256,23 +256,26 @@ class RecoveryWorker:
                 db.add(db_action)
                 db.flush()
 
+                is_payment_action = (proposed_action in ("RETRY_PAYMENT", "RETRY")) and res.get("async_reconciliation", False)
+                exec_status = "PENDING" if is_payment_action else res["status"]
+                
                 execution = Execution(
                     id=res["execution_id"],
                     action_id=db_action.id,
                     case_id=case.id,
-                    status=res["status"],
+                    status=exec_status,
                     provider="razorpay",
                     provider_reference=res["execution_id"],
                     amount=event.amount,
                     currency=event.currency,
                     attempted_at=datetime.utcnow(),
-                    completed_at=datetime.utcnow() if res["status"] == "SUCCESS" else None,
+                    completed_at=None if exec_status == "PENDING" else datetime.utcnow(),
                     result_code=None,
-                    failure_reason=res["message"]
+                    failure_reason=None if res["recovered"] or exec_status == "PENDING" else res["message"]
                 )
                 db.add(execution)
 
-                target_state = CaseStatus.RECOVERED if res["recovered"] else CaseStatus.FAILED
+                target_state = CaseStatus.EXECUTING if is_payment_action else (CaseStatus.RECOVERED if res["recovered"] else CaseStatus.FAILED)
                 CaseStateMachine.transition_status(db, case, target_state, "worker_execution_result", "SYSTEM", {"execution_id": res["execution_id"]})
 
                 from app.services.logging import logger as struct_logger
