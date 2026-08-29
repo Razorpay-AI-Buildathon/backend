@@ -182,3 +182,121 @@ def test_concurrent_worker_claiming_safety_without_redis(setup_db, monkeypatch):
     # Verify that only 1 decision was made, even though RedisLock returned True to both threads
     decisions = db_session.query(AiDecision).filter(AiDecision.case_id == "case_safe_db").all()
     assert len(decisions) == 1
+
+
+def test_outbox_publisher_crash_recovery(setup_db, monkeypatch):
+    db_session = setup_db
+    from app.services.outbox import create_outbox_event, OutboxPublisher
+    from app.models.case import OutboxEvent
+
+    # 1. Create a dummy outbox event
+    create_outbox_event(db_session, "evaluate_case", "case_crash_test", {"case_id": "case_crash_test"})
+    db_session.commit()
+
+    # 2. Simulate Redis down (OutboxPublisher initialization or enqueue fails)
+    from app.services.queue import RedisQueue
+    def mock_enqueue_fail(self, task_name, payload):
+        raise ConnectionError("Redis is down")
+    monkeypatch.setattr(RedisQueue, "enqueue", mock_enqueue_fail)
+
+    # Run publisher - event should fail to publish and remain in DB
+    published_count = OutboxPublisher.publish_pending_events(db_session)
+    assert published_count == 0
+
+    db_session.expire_all()
+    events = db_session.query(OutboxEvent).filter(OutboxEvent.aggregate_id == "case_crash_test").all()
+    assert len(events) == 1
+    assert events[0].published_at is None
+    assert events[0].attempt_count >= 1
+
+    # 3. Simulate publisher recovery and successful publish
+    published_events = []
+    def mock_enqueue_collect(self, task_name, payload):
+        published_events.append((task_name, payload))
+    monkeypatch.setattr(RedisQueue, "enqueue", mock_enqueue_collect)
+
+    published_count = OutboxPublisher.publish_pending_events(db_session)
+    assert published_count == 1
+
+    db_session.expire_all()
+    events = db_session.query(OutboxEvent).filter(OutboxEvent.aggregate_id == "case_crash_test").all()
+    assert len(events) == 1
+    assert events[0].published_at is not None
+
+
+def test_worker_outbox_duplicate_deduplication(setup_db, monkeypatch):
+    db_session = setup_db
+
+    # Mock httpx.post to simulate successful AI service call
+    class MockResponse:
+        def __init__(self, json_data, status_code=200):
+            self.json_data = json_data
+            self.status_code = status_code
+        def json(self):
+            return self.json_data
+
+    def mock_post(*args, **kwargs):
+        time.sleep(0.05)
+        return MockResponse({
+            "final_action": "RETRY_PAYMENT",
+            "final_confidence": 0.95,
+            "action_id": "act-outbox-dup"
+        })
+
+    monkeypatch.setattr(httpx, "post", mock_post)
+
+    # Mock RedisLock to bypass lock and isolate DB safety checks
+    from app.services.redis_cache import RedisLock
+    monkeypatch.setattr(RedisLock, "__enter__", lambda self: True)
+    monkeypatch.setattr(RedisLock, "__exit__", lambda self, exc_type, exc_val, exc_tb: None)
+
+    # Seed case details
+    merchant = Merchant(id="merch_dup", name="Dup Merchant")
+    customer = Customer(id="cust_dup", merchant_id="merch_dup", email="dup@test.com")
+    db_session.add_all([merchant, customer])
+    db_session.flush()
+
+    event = PaymentEvent(
+        id="evt_dup",
+        merchant_id="merch_dup",
+        customer_id="cust_dup",
+        event_type="FAILED_PAYMENT",
+        amount=500.0,
+        currency="INR"
+    )
+    db_session.add(event)
+    db_session.flush()
+
+    case = RecoveryCase(
+        id="case_dup",
+        event_id=event.id,
+        merchant_id="merch_dup",
+        customer_id="cust_dup",
+        status=CaseStatus.IDENTIFIED
+    )
+    db_session.add(case)
+    db_session.commit()
+
+    # We will simulate the worker running process_case_evaluation concurrently twice
+    # on duplicate events. Only one should successfully generate a decision.
+    worker = RecoveryWorker()
+    
+    results = []
+    def run_worker():
+        try:
+            worker.process_case_evaluation("case_dup")
+            results.append("processed")
+        except Exception as e:
+            results.append(str(e))
+
+    # Run twice concurrently
+    t1 = threading.Thread(target=run_worker)
+    t2 = threading.Thread(target=run_worker)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    db_session.expire_all()
+    decisions = db_session.query(AiDecision).filter(AiDecision.case_id == "case_dup").all()
+    assert len(decisions) == 1
