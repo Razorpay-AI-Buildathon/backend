@@ -78,8 +78,19 @@ class RecoveryWorker:
                 print(f"RecoveryWorker: Case {case_id} not found in database.")
                 return
 
-            if case.status not in (CaseStatus.IDENTIFIED, CaseStatus.ANALYZING):
-                print(f"RecoveryWorker: Case {case_id} is in status {case.status}, not ready for evaluation.")
+            # Force raw status select to bypass connection/pooling cache anomalies in SQLite/Postgres
+            raw_status = db.execute(
+                text("SELECT status FROM recovery_cases WHERE id = :id"),
+                {"id": case_id}
+            ).scalar()
+
+            if raw_status not in ("IDENTIFIED", "ANALYZING"):
+                print(f"RecoveryWorker: Case {case_id} is in status {raw_status}, not ready for evaluation.")
+                return
+
+            from datetime import datetime
+            if raw_status == "ANALYZING" and case.next_action_at and case.next_action_at > datetime.utcnow():
+                print(f"RecoveryWorker: Case {case_id} is scheduled for future evaluation at {case.next_action_at}. Skipping.")
                 return
 
             from app.models.case import Execution
@@ -298,7 +309,8 @@ class RecoveryWorker:
                         jitter = random.uniform(0.9, 1.1)
                         actual_delay = backoff_seconds * jitter
                         execute_at = time.time() + actual_delay
-                        
+                        from datetime import timedelta
+                        case.next_action_at = datetime.utcnow() + timedelta(seconds=actual_delay)
                         self.scheduler.schedule("evaluate_case", {"case_id": case.id}, execute_at)
                 db.commit()
             else:
