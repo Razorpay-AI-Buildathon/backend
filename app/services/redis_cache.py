@@ -5,7 +5,8 @@ from typing import Optional
 
 logger = logging.getLogger("recoverai.cache")
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+from app.core.config import settings
+REDIS_URL = settings.REDIS_URL
 
 class RedisCache:
     _client = None

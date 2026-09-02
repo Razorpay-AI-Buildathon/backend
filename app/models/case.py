@@ -234,6 +234,19 @@ class DeadLetterJob(Base):
     failed_at = Column(DateTime, default=datetime.utcnow)
 
 
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    google_subject_id = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, index=True, nullable=False)
+    name = Column(String, nullable=False)
+    picture = Column(String, nullable=True)
+    role = Column(String, default="OPERATOR", nullable=False) # ADMIN, OPERATOR, ANALYST, VIEWER
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_login_at = Column(DateTime, nullable=True)
+
+
 
 # Centralized State Machine Transitions Logic
 class CaseStateMachine:

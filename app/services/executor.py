@@ -43,8 +43,8 @@ class ExecutionSimulator:
                     return existing
 
             # Determine gateway adapter (default to simulated/demo mode)
-            gateway_mode = os.getenv("GATEWAY_MODE", "SIMULATION")
-            if gateway_mode == "PRODUCTION":
+            from app.core.config import settings
+            if settings.GATEWAY_MODE in ("PRODUCTION", "RAZORPAY_TEST"):
                 gateway = RazorpayPaymentGateway()
             else:
                 gateway = SimulatedPaymentGateway()

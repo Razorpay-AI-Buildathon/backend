@@ -195,6 +195,20 @@ class RecoveryWorker:
             context_str = json.dumps(state_input, sort_keys=True)
             context_hash = hashlib.sha256(context_str.encode("utf-8")).hexdigest()
             
+            from app.models.case import RecoveryAction, Execution, ActionState
+            
+            db_action = RecoveryAction(
+                id=action_id,
+                case_id=case.id,
+                action_type=proposed_action,
+                proposed_by="AI_PLANNER" if case.experiment_group == "TREATMENT" else "CONTROL_STRATEGY",
+                state=ActionState.PROPOSED,
+                authorization_token=None,
+                action_id=action_id,
+                execution_id=None
+            )
+            db.add(db_action)
+            
             ai_decision = AiDecision(
                 case_id=case.id,
                 action_id=action_id,
@@ -213,6 +227,7 @@ class RecoveryWorker:
             # Task 25: Verify against policy limits (amount threshold)
             max_limit = float(policy.amount_threshold) if policy else 5000.0
             if float(event.amount) > max_limit:
+                db_action.state = ActionState.REJECTED_BY_GUARD
                 CaseStateMachine.transition_status(
                     db, case, CaseStatus.HUMAN_REVIEW, "policy_amount_escalation", "SYSTEM",
                     {"reason": f"Payment amount {event.amount} exceeds policy threshold {max_limit}"}
@@ -252,19 +267,9 @@ class RecoveryWorker:
                     action_id=action_id
                 )
 
-                from app.models.case import RecoveryAction, Execution, ActionState
-                
-                db_action = RecoveryAction(
-                    id=action_id,
-                    case_id=case.id,
-                    action_type=proposed_action,
-                    proposed_by="AI_PLANNER" if case.experiment_group == "TREATMENT" else "CONTROL_STRATEGY",
-                    state=ActionState.EXECUTED if proposed_action in ("RETRY_PAYMENT", "RETRY") else ActionState.APPROVED_BY_GUARD,
-                    authorization_token=token,
-                    action_id=action_id,
-                    execution_id=res["execution_id"]
-                )
-                db.add(db_action)
+                db_action.state = ActionState.EXECUTED if proposed_action in ("RETRY_PAYMENT", "RETRY") else ActionState.APPROVED_BY_GUARD
+                db_action.authorization_token = token
+                db_action.execution_id = res["execution_id"]
                 db.flush()
 
                 is_payment_action = (proposed_action in ("RETRY_PAYMENT", "RETRY")) and res.get("async_reconciliation", False)

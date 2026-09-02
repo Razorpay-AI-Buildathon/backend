@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Header, Request, Cookie, Response
 from sqlalchemy.orm import Session
 from typing import Optional, List, Dict, Any
 import os
@@ -7,6 +7,7 @@ import uuid
 import secrets
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 import threading
 
 from app.db.session import get_db
@@ -21,6 +22,8 @@ from app.models.case import (
     Merchant,
     Customer,
     Execution,
+    OutboxEvent,
+    User,
 )
 from app.schemas.event import PaymentEventIngest, PaymentEventIngestResponse
 from app.schemas.api import (
@@ -91,13 +94,266 @@ def verify_api_key(
 
 
 
+def verify_api_key_or_session(
+    x_api_key: Optional[str] = Header(None),
+    x_merchant_id: Optional[str] = Header(None),
+    recoverai_session: Optional[str] = Cookie(None),
+    db: Session = Depends(get_db)
+) -> Optional[str]:
+    # 1. Attempt API Key auth first
+    if x_api_key:
+        return verify_api_key(x_api_key, x_merchant_id)
+        
+    # 2. Attempt Session Cookie auth
+    if recoverai_session:
+        session_data_str = RedisCache.get(f"session:{recoverai_session}")
+        if session_data_str:
+            try:
+                session_data = json.loads(session_data_str)
+                user = db.query(User).filter(User.id == session_data["user_id"], User.is_active == True).first()
+                if user:
+                    if user.role == "VIEWER":
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Access forbidden: Read-only VIEWER role cannot perform mutations"
+                        )
+                    return x_merchant_id
+            except HTTPException as he:
+                raise he
+            except Exception:
+                pass
+                
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication failed: Missing API Key or active operator session"
+    )
+
+
 def resolve_optional_api_key(
     x_api_key: Optional[str] = Header(None),
-    x_merchant_id: Optional[str] = Header(None)
+    x_merchant_id: Optional[str] = Header(None),
+    recoverai_session: Optional[str] = Cookie(None),
+    db: Session = Depends(get_db)
 ) -> Optional[str]:
-    if not x_api_key:
-        return None
-    return verify_api_key(x_api_key, x_merchant_id)
+    if x_api_key:
+        return verify_api_key(x_api_key, x_merchant_id)
+    
+    if recoverai_session:
+        session_data_str = RedisCache.get(f"session:{recoverai_session}")
+        if session_data_str:
+            try:
+                session_data = json.loads(session_data_str)
+                return x_merchant_id
+            except Exception:
+                pass
+    return None
+
+
+
+from fastapi.responses import RedirectResponse
+from app.core.config import settings
+
+def get_current_user(
+    recoverai_session: Optional[str] = Cookie(None),
+    db: Session = Depends(get_db)
+) -> User:
+    if not recoverai_session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired or not authenticated"
+        )
+    
+    session_data_str = RedisCache.get(f"session:{recoverai_session}")
+    if not session_data_str:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired or invalid"
+        )
+    
+    try:
+        session_data = json.loads(session_data_str)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid session encoding"
+        )
+        
+    user = db.query(User).filter(User.id == session_data["user_id"], User.is_active == True).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account disabled or not found"
+        )
+        
+    return user
+
+
+@router.get("/api/auth/google")
+def auth_google():
+    state = secrets.token_urlsafe(32)
+    
+    if not settings.GOOGLE_CLIENT_ID:
+        # Fallback to local mock auth callback flow for testing and demo simplicity when Google ID is unconfigured
+        redirect_url = f"/api/auth/google/callback?code=mock_code&state={state}"
+    else:
+        redirect_url = (
+            f"https://accounts.google.com/o/oauth2/v2/auth?"
+            f"client_id={settings.GOOGLE_CLIENT_ID}&"
+            f"redirect_uri={settings.GOOGLE_REDIRECT_URI}&"
+            f"response_type=code&"
+            f"scope=openid%20email%20profile&"
+            f"state={state}"
+        )
+        
+    redirect_resp = RedirectResponse(url=redirect_url)
+    # Store state token in a short-lived cookie for CSRF protection
+    redirect_resp.set_cookie(
+        key="oauth_state",
+        value=state,
+        httponly=True,
+        max_age=300,
+        samesite="lax",
+        secure=False
+    )
+    return redirect_resp
+
+
+@router.get("/api/auth/google/callback")
+def auth_google_callback(
+    code: str,
+    state: str,
+    response: Response,
+    oauth_state: Optional[str] = Cookie(None),
+    db: Session = Depends(get_db)
+):
+    if not oauth_state or state != oauth_state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired OAuth state parameter"
+        )
+        
+    sub = "google-sub-mock-12345"
+    email = "operator@recoverai.com"
+    name = "Default Operator"
+    picture = ""
+    
+    if settings.GOOGLE_CLIENT_ID and settings.GOOGLE_CLIENT_SECRET:
+        import httpx
+        try:
+            token_resp = httpx.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": settings.GOOGLE_CLIENT_ID,
+                    "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+                    "grant_type": "authorization_code"
+                },
+                timeout=5.0
+            )
+            if token_resp.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Google OAuth token exchange failed: {token_resp.text}"
+                )
+            
+            token_data = token_resp.json()
+            id_token = token_data.get("id_token")
+            if not id_token:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Missing id_token from Google OAuth response"
+                )
+                
+            parts = id_token.split(".")
+            if len(parts) != 3:
+                raise Exception("Invalid JWT token format")
+            
+            import base64
+            payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            payload_json = base64.urlsafe_b64decode(payload_b64).decode("utf-8")
+            claims = json.loads(payload_json)
+            
+            now = datetime.utcnow().timestamp()
+            if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+                raise Exception("Invalid token issuer")
+            if claims.get("aud") != settings.GOOGLE_CLIENT_ID:
+                raise Exception("Audience mismatch")
+            if claims.get("exp") < now:
+                raise Exception("Token expired")
+                
+            sub = claims["sub"]
+            email = claims["email"]
+            name = claims.get("name", "Operator")
+            picture = claims.get("picture", "")
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Google identity validation failed: {str(e)}"
+            )
+
+    user = db.query(User).filter(User.google_subject_id == sub).first()
+    if not user:
+        user_count = db.query(User).count()
+        role = "ADMIN" if user_count == 0 else "OPERATOR"
+        user = User(
+            google_subject_id=sub,
+            email=email,
+            name=name,
+            picture=picture,
+            role=role,
+            is_active=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(user)
+        db.flush()
+        
+    user.last_login_at = datetime.utcnow()
+    db.commit()
+    
+    session_token = secrets.token_urlsafe(32)
+    session_data = {
+        "user_id": user.id,
+        "email": user.email,
+        "role": user.role
+    }
+    RedisCache.set(f"session:{session_token}", json.dumps(session_data), expire_seconds=86400)
+    
+    frontend_url = os.getenv("FRONTEND_REDIRECT_URL", "http://localhost:3000/")
+    redirect_resp = RedirectResponse(url=frontend_url)
+    
+    redirect_resp.set_cookie(
+        key="recoverai_session",
+        value=session_token,
+        httponly=True,
+        max_age=86400,
+        samesite="lax",
+        secure=False
+    )
+    redirect_resp.delete_cookie("oauth_state")
+    return redirect_resp
+
+
+@router.get("/api/auth/me")
+def auth_me(user: User = Depends(get_current_user)):
+    return {
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "picture": user.picture,
+        "role": user.role,
+        "is_active": user.is_active,
+        "last_login_at": user.last_login_at
+    }
+
+
+@router.post("/api/auth/logout")
+def auth_logout(response: Response, recoverai_session: Optional[str] = Cookie(None)):
+    if recoverai_session:
+        RedisCache.delete(f"session:{recoverai_session}")
+    response.delete_cookie("recoverai_session")
+    return {"status": "logged_out"}
+
 
 
 # Helper function to redact raw secrets/keys recursively
@@ -341,8 +597,8 @@ def get_metrics(db: Session = Depends(get_db), merchant_id: Optional[str] = Depe
 
     total_cases = cases_query.count()
     if total_cases > 0:
-        revenue_at_risk = events_query.scalar() or 0.0
-        revenue_recovered = recovered_query.filter(RecoveryCase.status == CaseStatus.RECOVERED).scalar() or 0.0
+        revenue_at_risk = float(events_query.scalar() or 0.0)
+        revenue_recovered = float(recovered_query.filter(RecoveryCase.status == CaseStatus.RECOVERED).scalar() or 0.0)
         recovery_rate = round((revenue_recovered / revenue_at_risk * 100), 2) if revenue_at_risk > 0 else 0.0
         
         guard_blocks = cases_query.filter(RecoveryCase.status == CaseStatus.BLOCKED).count()
@@ -647,6 +903,26 @@ def list_cases(
     return CaseListResponse(total=total, page=page, page_size=page_size, items=items)
 
 
+@router.get("/api/cases/stream")
+async def sse_cases_stream():
+    import asyncio
+    from fastapi.responses import StreamingResponse
+    from app.services.sse import sse_manager
+    
+    async def event_generator():
+        q = asyncio.Queue()
+        sse_manager.register(q)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=20.0)
+                    yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        finally:
+            sse_manager.unregister(q)
+            
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 @router.get("/api/cases/{case_id}", response_model=CaseDetail)
 def get_case(case_id: str, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(resolve_optional_api_key)):
     # Read-Only Endpoint
@@ -1160,7 +1436,7 @@ _review_lock = threading.Lock()
 
 
 @router.post("/api/cases/{case_id}/review")
-def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key_or_session)):
     with _review_lock:
         c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).with_for_update().first()
         if not c:
@@ -1251,11 +1527,17 @@ def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get
 
 
 @router.post("/api/webhooks/provider")
-def handle_provider_webhook(
-    req: Dict[str, Any],
+async def handle_provider_webhook(
+    request: Request,
     x_razorpay_signature: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ):
+    body_bytes = await request.body()
+    try:
+        req = json.loads(body_bytes)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body payload")
+
     event_name = req.get("event")
     event_id = req.get("provider_event_id") or req.get("id") or f"evt_{uuid.uuid4().hex[:12]}"
 
@@ -1265,12 +1547,13 @@ def handle_provider_webhook(
         raise HTTPException(status_code=409, detail="Webhook is currently being processed by another worker")
 
     try:
-        webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
-        if x_razorpay_signature:
-            if x_razorpay_signature != "test_signature" and webhook_secret:
+        webhook_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        if webhook_secret:
+            if not x_razorpay_signature:
+                raise HTTPException(status_code=400, detail="Signature missing on webhook payload")
+            if x_razorpay_signature != "test_signature":
                 import hmac
                 import hashlib
-                body_bytes = json.dumps(req, sort_keys=True).encode("utf-8")
                 expected = hmac.new(webhook_secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
                 if not hmac.compare_digest(expected, x_razorpay_signature):
                     raise HTTPException(status_code=400, detail="Invalid signature")
@@ -1337,30 +1620,8 @@ def handle_provider_webhook(
             print(f"Webhook Lock Release Error: {le}")
 
 
-@router.get("/api/cases/stream")
-async def sse_cases_stream():
-    import asyncio
-    from fastapi.responses import StreamingResponse
-    from app.services.sse import sse_manager
-    
-    async def event_generator():
-        q = asyncio.Queue()
-        sse_manager.register(q)
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=20.0)
-                    yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
-                except asyncio.TimeoutError:
-                    yield ": ping\n\n"
-        finally:
-            sse_manager.unregister(q)
-            
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
 @router.post("/api/policies", response_model=MerchantPolicyResponse)
-def create_merchant_policy(req: MerchantPolicyCreate, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+def create_merchant_policy(req: MerchantPolicyCreate, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key_or_session)):
     if merchant_id and req.merchant_id != merchant_id:
         raise HTTPException(status_code=403, detail="Access forbidden: Tenant ID mismatch")
 
@@ -1398,7 +1659,7 @@ def create_merchant_policy(req: MerchantPolicyCreate, db: Session = Depends(get_
 
 
 @router.get("/api/policies/{merchant_id}", response_model=MerchantPolicyResponse)
-def get_merchant_policy(merchant_id: str, db: Session = Depends(get_db), auth_merchant_id: Optional[str] = Depends(verify_api_key)):
+def get_merchant_policy(merchant_id: str, db: Session = Depends(get_db), auth_merchant_id: Optional[str] = Depends(verify_api_key_or_session)):
     if auth_merchant_id and merchant_id != auth_merchant_id:
         raise HTTPException(status_code=403, detail="Access forbidden: Tenant ID mismatch")
 
@@ -1414,7 +1675,7 @@ def get_merchant_policy(merchant_id: str, db: Session = Depends(get_db), auth_me
 
 
 @router.post("/api/cases/detect-timeouts")
-def detect_timeouts(db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+def detect_timeouts(db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key_or_session)):
     from app.models.case import RecoveryCase, CaseStatus, CaseStateMachine
     from datetime import datetime, timezone, timedelta
     
@@ -1441,7 +1702,7 @@ def detect_timeouts(db: Session = Depends(get_db), merchant_id: Optional[str] = 
     return {"status": "success", "processed": reconfigured}
 
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class AdminControlRequest(BaseModel):
     action: str  # PAUSE, RESUME, RETRY, CANCEL, ESCALATE, CLOSE
@@ -1458,7 +1719,7 @@ def admin_control_case(
     case_id: str,
     req: AdminControlRequest,
     db: Session = Depends(get_db),
-    merchant_id: Optional[str] = Depends(verify_api_key)
+    merchant_id: Optional[str] = Depends(verify_api_key_or_session)
 ):
     # Operator must be authenticated (verify_api_key throws 401 if missing)
     case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
@@ -1523,7 +1784,7 @@ def admin_control_case(
 def cleanup_pii(
     req: CleanupPiiRequest,
     db: Session = Depends(get_db),
-    merchant_id: Optional[str] = Depends(verify_api_key)
+    merchant_id: Optional[str] = Depends(verify_api_key_or_session)
 ):
     # Enforce authentication
     cutoff = datetime.utcnow() - timedelta(days=req.retention_days)
@@ -1555,3 +1816,346 @@ def cleanup_pii(
 
     db.commit()
     return {"status": "success", "redacted_cases_count": count}
+
+
+# ─── Global Audit Log ─────────────────────────────────────────────────────────
+
+@router.get("/api/audit")
+def list_audit_events(
+    event_type: Optional[str] = Query(None),
+    decision_source: Optional[str] = Query(None),
+    case_id: Optional[str] = Query(None),
+    actor: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    merchant_id: Optional[str] = Depends(verify_api_key),
+):
+    """Global audit log with filtering by event_type, decision_source, case_id, actor."""
+    from app.models.case import AuditEvent
+    q = db.query(AuditEvent)
+    if event_type:
+        q = q.filter(AuditEvent.event_type == event_type)
+    if decision_source:
+        q = q.filter(AuditEvent.decision_source == decision_source)
+    if case_id:
+        q = q.filter(AuditEvent.case_id == case_id)
+    if actor:
+        q = q.filter(AuditEvent.actor == actor)
+    total = q.count()
+    events = q.order_by(AuditEvent.timestamp.desc()).offset(offset).limit(limit).all()
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "items": [
+            {
+                "id": e.id,
+                "case_id": e.case_id,
+                "action_id": e.action_id,
+                "event_type": e.event_type,
+                "actor": e.actor,
+                "decision_source": e.decision_source,
+                "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+                "metadata": e.metadata_json or {},
+            }
+            for e in events
+        ],
+    }
+
+
+# ─── Strategy Analytics ────────────────────────────────────────────────────────
+
+@router.get("/api/analytics/strategies")
+def strategy_analytics(
+    db: Session = Depends(get_db),
+    merchant_id: Optional[str] = Depends(verify_api_key),
+):
+    """Aggregate strategy performance metrics from recovery actions."""
+    from sqlalchemy import func
+
+    rows = (
+        db.query(
+            RecoveryAction.action_type,
+            func.count(RecoveryAction.id).label("attempts"),
+        )
+        .group_by(RecoveryAction.action_type)
+        .all()
+    )
+
+    recovered_by_strategy = (
+        db.query(RecoveryAction.action_type, func.count(RecoveryCase.id).label("recovered"))
+        .join(RecoveryCase, RecoveryCase.id == RecoveryAction.case_id)
+        .filter(RecoveryCase.status == CaseStatus.RECOVERED)
+        .group_by(RecoveryAction.action_type)
+        .all()
+    )
+    recovered_map = {r.action_type: r.recovered for r in recovered_by_strategy}
+
+    result = []
+    for row in rows:
+        strategy = row.action_type.value if hasattr(row.action_type, "value") else str(row.action_type)
+        attempts = row.attempts or 0
+        recovered = recovered_map.get(row.action_type, 0)
+        result.append({
+            "strategy": strategy,
+            "attempts": attempts,
+            "recovered": recovered,
+            "recovery_rate": round((recovered / attempts * 100), 1) if attempts else 0.0,
+        })
+
+    result.sort(key=lambda x: x["recovery_rate"], reverse=True)
+    return {"strategies": result}
+
+
+
+class CreateOrderRequest(BaseModel):
+    amount: int = Field(..., description="Amount in paise (minimum 100)")
+    currency: str = Field("INR", description="Three-letter currency code")
+    receipt: Optional[str] = Field(None, description="Receipt identifier")
+
+class VerifyPaymentRequest(BaseModel):
+    razorpay_payment_id: str
+    razorpay_order_id: str
+    razorpay_signature: str
+
+@router.post("/api/create-order")
+def create_order(req: CreateOrderRequest):
+    if req.amount < 100:
+        raise HTTPException(status_code=400, detail="Amount must be at least 100 paise (1 INR)")
+        
+    from app.core.config import settings
+    import httpx
+    
+    if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=500, detail="Razorpay API credentials are not configured on the server")
+        
+    payload = {
+        "amount": req.amount,
+        "currency": req.currency,
+        "receipt": req.receipt or f"receipt_{uuid.uuid4().hex[:8]}"
+    }
+    
+    try:
+        auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
+        resp = httpx.post(
+            "https://api.razorpay.com/v1/orders",
+            json=payload,
+            auth=auth,
+            timeout=10.0
+        )
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return {
+                "order_id": data["id"],
+                "amount": data["amount"],
+                "currency": data["currency"]
+            }
+        else:
+            raise HTTPException(status_code=500, detail=f"Razorpay API error: {resp.text}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to communicate with Razorpay: {str(e)}")
+
+
+class CheckoutFailedRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: Optional[str] = None
+    error_code: Optional[str] = Field(None, description="Razorpay error code e.g. BAD_REQUEST_ERROR")
+    error_description: Optional[str] = None
+    error_reason: Optional[str] = None
+    amount: int = Field(50000, description="Amount in paise")
+    currency: str = Field("INR")
+
+
+@router.post("/api/verify-payment")
+def verify_payment(req: VerifyPaymentRequest, db: Session = Depends(get_db)):
+    if not req.razorpay_payment_id or not req.razorpay_order_id or not req.razorpay_signature:
+        raise HTTPException(status_code=400, detail="Missing required payment credentials or signature fields")
+
+    from app.core.config import settings
+    import hmac
+    import hashlib
+
+    msg = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
+    secret = settings.RAZORPAY_KEY_SECRET
+
+    generated = hmac.new(
+        secret.encode("utf-8"),
+        msg.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(generated, req.razorpay_signature):
+        raise HTTPException(status_code=400, detail="Payment signature verification failed")
+
+    # --- Persist successful checkout to DB ---
+    checkout_merchant_id = "checkout_demo"
+    checkout_customer_id = f"cust_checkout_{req.razorpay_payment_id[:8]}"
+
+    merchant = db.query(Merchant).filter(Merchant.id == checkout_merchant_id).first()
+    if not merchant:
+        merchant = Merchant(
+            id=checkout_merchant_id,
+            name="Checkout Demo Merchant",
+            amount_threshold=5000.00,
+            max_retries=3
+        )
+        db.add(merchant)
+        db.flush()
+
+    customer = db.query(Customer).filter(Customer.id == checkout_customer_id).first()
+    if not customer:
+        customer = Customer(
+            id=checkout_customer_id,
+            merchant_id=checkout_merchant_id,
+            email="checkout@razorpay.demo",
+            risk_score=0.05,
+            payment_history_success_rate=0.99
+        )
+        db.add(customer)
+        db.flush()
+
+    event_id = f"evt_checkout_{req.razorpay_payment_id}"
+    existing = db.query(PaymentEvent).filter(PaymentEvent.id == event_id).first()
+    if not existing:
+        event = PaymentEvent(
+            id=event_id,
+            merchant_id=checkout_merchant_id,
+            customer_id=checkout_customer_id,
+            event_type="CHECKOUT_SUCCESS",
+            amount=500.00,
+            currency="INR",
+            failure_code=None,
+            provider="razorpay",
+            provider_event_id=req.razorpay_order_id,
+            payload_metadata={"razorpay_payment_id": req.razorpay_payment_id, "razorpay_order_id": req.razorpay_order_id}
+        )
+        db.add(event)
+        db.flush()
+
+        case_id = f"case_checkout_{req.razorpay_payment_id}"
+        case = RecoveryCase(
+            id=case_id,
+            event_id=event_id,
+            merchant_id=checkout_merchant_id,
+            customer_id=checkout_customer_id,
+            status=CaseStatus.RECOVERED,
+            priority_score=10,
+            expected_recovery_value=Decimal("500.00"),
+            experiment_group="TREATMENT"
+        )
+        db.add(case)
+        db.flush()
+
+        execution = Execution(
+            id=f"exec_checkout_{req.razorpay_payment_id}",
+            case_id=case_id,
+            provider="razorpay",
+            provider_reference=req.razorpay_payment_id,
+            status="SUCCESS",
+            amount=Decimal("500.00"),
+            reconciled_amount=Decimal("500.00")
+        )
+        db.add(execution)
+        db.commit()
+
+    return {"status": "success", "message": "Payment verified and recorded in database", "payment_id": req.razorpay_payment_id}
+
+
+@router.post("/api/checkout/failed")
+def checkout_payment_failed(req: CheckoutFailedRequest, db: Session = Depends(get_db)):
+    """Called when Razorpay checkout payment.failed event fires on the frontend.
+    Creates a PaymentEvent that feeds into the full RecoverAI recovery pipeline."""
+    checkout_merchant_id = "checkout_demo"
+    checkout_customer_id = f"cust_checkout_{req.razorpay_order_id[-8:]}"
+
+    merchant = db.query(Merchant).filter(Merchant.id == checkout_merchant_id).first()
+    if not merchant:
+        merchant = Merchant(
+            id=checkout_merchant_id,
+            name="Checkout Demo Merchant",
+            amount_threshold=5000.00,
+            max_retries=3
+        )
+        db.add(merchant)
+        db.flush()
+
+    customer = db.query(Customer).filter(Customer.id == checkout_customer_id).first()
+    if not customer:
+        customer = Customer(
+            id=checkout_customer_id,
+            merchant_id=checkout_merchant_id,
+            email=f"{checkout_customer_id}@razorpay.demo",
+            risk_score=0.45,
+            payment_history_success_rate=0.60
+        )
+        db.add(customer)
+        db.flush()
+
+    event_id = f"evt_checkout_fail_{req.razorpay_order_id}"
+    existing = db.query(PaymentEvent).filter(PaymentEvent.id == event_id).first()
+    if existing:
+        case = db.query(RecoveryCase).filter(RecoveryCase.event_id == event_id).first()
+        return {"status": "already_processed", "event_id": event_id, "case_id": case.id if case else ""}
+
+    # Map Razorpay error codes to our internal failure_codes
+    failure_map = {
+        "BAD_REQUEST_ERROR": "card_declined",
+        "GATEWAY_ERROR": "bank_timeout",
+        "SERVER_ERROR": "network_error",
+    }
+    failure_code = failure_map.get(req.error_code or "", req.error_reason or "card_declined")
+    amount_inr = req.amount / 100.0
+
+    event = PaymentEvent(
+        id=event_id,
+        merchant_id=checkout_merchant_id,
+        customer_id=checkout_customer_id,
+        event_type="FAILED_PAYMENT",
+        amount=amount_inr,
+        currency=req.currency,
+        failure_code=failure_code,
+        provider="razorpay",
+        provider_event_id=req.razorpay_order_id,
+        payload_metadata={
+            "razorpay_order_id": req.razorpay_order_id,
+            "razorpay_payment_id": req.razorpay_payment_id,
+            "error_code": req.error_code,
+            "error_description": req.error_description,
+            "error_reason": req.error_reason,
+            "source": "standard_checkout"
+        }
+    )
+    db.add(event)
+    db.flush()
+
+    case_id = f"case_checkout_fail_{req.razorpay_order_id}"
+    case = RecoveryCase(
+        id=case_id,
+        event_id=event_id,
+        merchant_id=checkout_merchant_id,
+        customer_id=checkout_customer_id,
+        status=CaseStatus.IDENTIFIED,
+        priority_score=80,
+        expected_recovery_value=Decimal(str(amount_inr)),
+        experiment_group="TREATMENT"
+    )
+    db.add(case)
+
+    # Outbox event to trigger worker pipeline
+    outbox = OutboxEvent(
+        id=f"outbox_checkout_fail_{req.razorpay_order_id}",
+        event_type="NEW_CASE",
+        aggregate_id=case_id,
+        payload={"case_id": case_id, "source": "checkout_failure"}
+    )
+    db.add(outbox)
+    db.commit()
+
+    return {
+        "status": "queued",
+        "message": "Payment failure recorded and recovery pipeline triggered",
+        "event_id": event_id,
+        "case_id": case_id
+    }
+

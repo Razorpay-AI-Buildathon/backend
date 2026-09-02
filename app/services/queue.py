@@ -3,8 +3,13 @@ import json
 import redis
 from typing import Optional, Dict, Any
 
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+from urllib.parse import urlparse
+from app.core.config import settings
+
+redis_url = settings.REDIS_URL
+parsed = urlparse(redis_url)
+REDIS_HOST = parsed.hostname or "localhost"
+REDIS_PORT = parsed.port or 6379
 
 class RedisQueue:
     QUEUE_KEY = "recoverai_task_queue"
