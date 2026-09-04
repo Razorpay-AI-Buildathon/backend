@@ -135,3 +135,88 @@ The backend operates as the deterministic brain and state manager of the Recover
 - The backend API exposes endpoints for a human operator to override AI failures.
 - If a case fails 3 times, or the ActionGuard blocks an action due to high risk, the state machine halts at `HUMAN_REVIEW`.
 - An operator can review the AI's audit trail and submit an override (`APPROVE`, `REJECT`, `CLOSE`). The backend API intercepts this, generates an `override-` or `FAIL-` token, and bypasses the ActionGuard to immediately trigger the Execution Worker.
+
+## Database Structure
+
+The PostgreSQL database acts as the core source of truth for all recovery operations. The entity-relationship diagram below outlines how configurations, events, cases, and execution logs interlink.
+
+```mermaid
+erDiagram
+    MERCHANT ||--o{ CUSTOMER : has
+    MERCHANT ||--o{ RECOVERY_CASE : owns
+    MERCHANT ||--|| MERCHANT_RECOVERY_POLICY : configures
+    CUSTOMER ||--o{ RECOVERY_CASE : involved_in
+    PAYMENT_EVENT ||--|| RECOVERY_CASE : triggers
+    RECOVERY_CASE ||--o{ RECOVERY_ACTION : tracks
+    RECOVERY_CASE ||--o{ AUDIT_EVENT : logs
+    RECOVERY_ACTION ||--o{ EXECUTION : results_in
+    RECOVERY_ACTION ||--o{ AUDIT_EVENT : logs
+
+    MERCHANT {
+        string id PK
+        string name
+        numeric amount_threshold
+        integer max_retries
+    }
+    
+    CUSTOMER {
+        string id PK
+        string merchant_id FK
+        string email
+        numeric risk_score
+        numeric payment_history_success_rate
+    }
+    
+    PAYMENT_EVENT {
+        string id PK
+        string event_type
+        numeric amount
+        string currency
+        string failure_code
+        string provider
+    }
+    
+    RECOVERY_CASE {
+        string id PK
+        string event_id FK
+        string merchant_id FK
+        string customer_id FK
+        string status
+        integer current_recovery_attempt
+        numeric expected_recovery_value
+    }
+    
+    RECOVERY_ACTION {
+        string id PK
+        string case_id FK
+        string action_type
+        string state
+        string authorization_token
+    }
+    
+    EXECUTION {
+        string id PK
+        string action_id FK
+        string case_id FK
+        string status
+        numeric amount
+        numeric reconciled_amount
+    }
+    
+    MERCHANT_RECOVERY_POLICY {
+        string id PK
+        string merchant_id FK
+        integer max_attempts
+        numeric amount_threshold
+        numeric human_review_threshold
+    }
+    
+    AUDIT_EVENT {
+        string id PK
+        string case_id FK
+        string action_id FK
+        string event_type
+        string actor
+        string decision_source
+    }
+```
