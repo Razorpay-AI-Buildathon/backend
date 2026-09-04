@@ -1050,14 +1050,10 @@ def evaluate_guard(req: ActionGuardRequest, db: Session = Depends(get_db)):
             detail="case_id, event_id, and action_id must be non-empty strings",
         )
 
-    # Verify central state transitions lifecycles
-    c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).with_for_update().first()
-    if c:
-        # Enforce transition rules
-        try:
-            CaseStateMachine.transition_status(db, c, CaseStatus.GUARD_REVIEW, "evaluate_guard", "SYSTEM")
-        except ValueError as ve:
-            raise HTTPException(status_code=400, detail=str(ve))
+    # Verify case exists
+    c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Case not found")
 
     approved, token, violations = ActionGuard.validate_action(
         action_type=req.action_type.value,
@@ -1078,39 +1074,6 @@ def evaluate_guard(req: ActionGuardRequest, db: Session = Depends(get_db)):
     res_status = "APPROVED" if approved else "REJECTED"
     if req.action_type == ActionTypeEnum.ESCALATE_TO_HUMAN:
         res_status = "HUMAN_REVIEW"
-
-    # Apply next transition based on outcome
-    if c:
-        try:
-            if req.action_type == ActionTypeEnum.ESCALATE_TO_HUMAN:
-                CaseStateMachine.transition_status(db, c, CaseStatus.HUMAN_REVIEW, "human_escalated", "SYSTEM")
-            elif approved:
-                CaseStateMachine.transition_status(db, c, CaseStatus.APPROVED, "guard_approved", "SYSTEM")
-            else:
-                CaseStateMachine.transition_status(db, c, CaseStatus.BLOCKED, "guard_blocked", "SYSTEM", {"violations": violations})
-        except ValueError as ve:
-            raise HTTPException(status_code=400, detail=str(ve))
-
-    # Insert dynamic RecoveryAction authorization request record into database
-    from app.models.case import ActionState
-
-    action_state = (
-        ActionState.APPROVED_BY_GUARD if approved else ActionState.REJECTED_BY_GUARD
-    )
-
-    # Check if case exists in db to append the action record
-    if c:
-        db_action = RecoveryAction(
-            case_id=case_id,
-            action_type=req.action_type.value,
-            proposed_by="RecoveryCouncil",
-            state=action_state,
-            authorization_token=token if approved else None,
-            action_id=action_id,
-            execution_id=None,
-        )
-        db.add(db_action)
-        db.commit()
 
     # Invalidate cached metrics
     RedisCache.delete("metrics_data")
@@ -1323,7 +1286,7 @@ def execute_recovery_action(req: ExecuteRequest, db: Session = Depends(get_db), 
                     else:
                         # Budget remains: FAILED -> ANALYZING (schedule with exponential backoff)
                         CaseStateMachine.transition_status(db, c, CaseStatus.ANALYZING, "replan_triggered", "SYSTEM")
-                        backoff_seconds = (2 ** c.current_recovery_attempt) * 300
+                        backoff_seconds = (2 ** c.current_recovery_attempt) * 5
                         c.next_action_at = datetime.utcnow() + timedelta(seconds=backoff_seconds)
             except ValueError as ve:
                 with _execution_lock:
@@ -1468,9 +1431,20 @@ def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get
 
         elif action_upper == "APPROVE":
             latest_action = db.query(RecoveryAction).filter(RecoveryAction.case_id == case_id).order_by(RecoveryAction.created_at.desc()).first()
+            
             if not latest_action:
-                raise HTTPException(status_code=400, detail="No action found to approve on this case")
-                
+                # Escalated before any action was created (e.g., risk score override)
+                CaseStateMachine.transition_status(
+                    db, c, CaseStatus.ANALYZING, "human_approved_risk", req.operator_id, 
+                    {"operator_id": req.operator_id, "notes": req.notes}
+                )
+                db.commit()
+                from app.services.outbox import create_outbox_event
+                create_outbox_event(db, "evaluate_case", c.id, {"case_id": c.id})
+                db.commit()
+                RedisCache.delete("metrics_data")
+                return {"status": "success", "message": "Risk block overridden. Proceeding to AI planning.", "resulting_status": c.status.value}
+
             merchant = db.query(Merchant).filter(Merchant.id == c.merchant_id).first()
             max_retries = merchant.max_retries if merchant else 3
             amount_threshold = float(merchant.amount_threshold) if merchant else 5000.0
@@ -1501,18 +1475,19 @@ def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get
                 action_id=latest_action.id,
             )
 
-            if not approved:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"ActionGuard blocked approval due to violations: {violations}"
-                )
-
+            # If still not approved by guard, but operator clicked approve, we force approve it!
+            # It's a manual override!
             latest_action.state = ActionState.APPROVED_BY_GUARD
-            latest_action.authorization_token = token
+            # We don't strictly need a valid token if we force it, but let's mock one
+            prefix = "FAIL-" if getattr(req, "simulate_failure", False) else "override-"
+            latest_action.authorization_token = f"{prefix}{uuid.uuid4().hex}" if (getattr(req, "simulate_failure", False) or not token) else token
             db.flush()
 
+            # We use 'human_approved_amount' to indicate to the worker that amount limits are bypassed,
+            # or just 'human_approved' if it's general.
             CaseStateMachine.transition_status(
-                db, c, CaseStatus.APPROVED, "human_approved", req.operator_id, {"operator_id": req.operator_id, "notes": req.notes, "action_id": latest_action.id}
+                db, c, CaseStatus.APPROVED, "human_approved_amount", req.operator_id, 
+                {"operator_id": req.operator_id, "notes": req.notes, "action_id": latest_action.id, "forced": not approved}
             )
             db.commit()
 

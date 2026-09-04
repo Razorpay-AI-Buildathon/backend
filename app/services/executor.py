@@ -22,6 +22,7 @@ class ExecutionSimulator:
         action_id: str = None,
         case_id: str = None,
         event_id: str = None,
+        simulate_failure: bool = False,
     ) -> Dict[str, Any]:
         """
         Deterministic downstream payment recovery execution wrapper.
@@ -36,10 +37,10 @@ class ExecutionSimulator:
         target_id = action_id or f"SIM-{uuid.uuid4().hex[:8].upper()}"
 
         with _execution_lock:
-            # 2. Idempotency Check: Return existing execution result if already completed
+            # 2. Idempotency Check: Return existing execution result if already completed and NOT failed
             if target_id in EXECUTION_REGISTRY:
                 existing = EXECUTION_REGISTRY[target_id]
-                if existing.get("status") != "PENDING":
+                if existing.get("status") not in ("PENDING", "FAILED"):
                     return existing
 
             # Determine gateway adapter (default to simulated/demo mode)
@@ -57,7 +58,8 @@ class ExecutionSimulator:
                 case_id=case_id or "demo-case",
                 event_id=event_id or "event-id",
                 action_id=target_id,
-                ground_truth=ground_truth
+                ground_truth=ground_truth,
+                simulate_failure=simulate_failure,
             )
 
             res = {

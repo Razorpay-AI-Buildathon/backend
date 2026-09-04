@@ -34,7 +34,8 @@ class PaymentGateway(ABC):
         case_id: str,
         event_id: str,
         action_id: str,
-        ground_truth: Optional[Dict[str, Any]] = None
+        ground_truth: Optional[Dict[str, Any]] = None,
+        simulate_failure: bool = False
     ) -> PaymentGatewayResult:
         pass
 
@@ -47,10 +48,20 @@ class SimulatedPaymentGateway(PaymentGateway):
         case_id: str,
         event_id: str,
         action_id: str,
-        ground_truth: Optional[Dict[str, Any]] = None
+        ground_truth: Optional[Dict[str, Any]] = None,
+        simulate_failure: bool = False
     ) -> PaymentGatewayResult:
         
         provider_ref = f"SIM-TXN-{uuid.uuid4().hex[:12].upper()}"
+
+        if simulate_failure:
+            return PaymentGatewayResult(
+                success=False,
+                recovered=False,
+                provider_reference=provider_ref,
+                result_code="SIM_FORCED_FAILURE",
+                failure_reason="Operator forced a simulated failure to demonstrate retry backoff.",
+            )
 
         if action_type == "DO_NOTHING":
             return PaymentGatewayResult(
@@ -102,7 +113,8 @@ class RazorpayPaymentGateway(PaymentGateway):
         case_id: str,
         event_id: str,
         action_id: str,
-        ground_truth: Optional[Dict[str, Any]] = None
+        ground_truth: Optional[Dict[str, Any]] = None,
+        simulate_failure: bool = False
     ) -> PaymentGatewayResult:
         from app.core.config import settings
         import httpx

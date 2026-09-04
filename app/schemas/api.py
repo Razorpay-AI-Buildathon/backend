@@ -222,6 +222,7 @@ class HumanReviewRequest(BaseModel):
     action: str
     operator_id: str
     notes: Optional[str] = None
+    simulate_failure: Optional[bool] = False
 
 
 class MerchantPolicyCreate(BaseModel):
