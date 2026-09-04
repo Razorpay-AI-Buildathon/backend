@@ -1,14 +1,14 @@
 import uuid
+import os
 import threading
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from decimal import Decimal
+from app.services.gateway import SimulatedPaymentGateway, RazorpayPaymentGateway
 
 # Canonical persistent execution records store mapping
-# Maps execution_id (or action_id) -> execution result
 EXECUTION_REGISTRY: Dict[str, Dict[str, Any]] = {}
 _execution_lock = threading.Lock()
-
 
 class ExecutionSimulator:
     @staticmethod
@@ -18,14 +18,15 @@ class ExecutionSimulator:
         currency: str,
         is_guard_approved: bool,
         auth_token: str = None,
-        ground_truth: Dict[str, Any] = None,
+        ground_truth: Optional[Dict[str, Any]] = None,
         action_id: str = None,
         case_id: str = None,
         event_id: str = None,
+        simulate_failure: bool = False,
     ) -> Dict[str, Any]:
         """
-        Deterministic downstream payment recovery execution simulator.
-        Ensures that blocked actions are never executed and enforces idempotency bounds.
+        Deterministic downstream payment recovery execution wrapper.
+        Delegates core processing to underlying PaymentGateway abstractions.
         """
         # 1. Hard validation: Blocked actions must never execute
         if not is_guard_approved or not auth_token:
@@ -36,82 +37,45 @@ class ExecutionSimulator:
         target_id = action_id or f"SIM-{uuid.uuid4().hex[:8].upper()}"
 
         with _execution_lock:
-            # 2. Idempotency Check: Return existing execution result if already completed and not a placeholder PENDING record
+            # 2. Idempotency Check: Return existing execution result if already completed and NOT failed
             if target_id in EXECUTION_REGISTRY:
                 existing = EXECUTION_REGISTRY[target_id]
-                if existing.get("status") != "PENDING":
+                if existing.get("status") not in ("PENDING", "FAILED"):
                     return existing
 
-            # 3. DO_NOTHING & ESCALATE_TO_HUMAN are no-ops on payment systems
-            if action_type == "DO_NOTHING":
-                res = {
-                    "execution_id": target_id,
-                    "action_id": target_id,
-                    "case_id": case_id or "demo-case",
-                    "event_id": event_id or "event-id",
-                    "action": action_type,
-                    "amount": amount,
-                    "currency": currency,
-                    "status": "SUCCESS",
-                    "recovered": False,
-                    "recovered_amount": Decimal("0.00"),
-                    "message": "No financial action requested",
-                    "executed_at": datetime.now(timezone.utc).isoformat(),
-                }
-                EXECUTION_REGISTRY[target_id] = res
-                return res
+            # Determine gateway adapter (default to simulated/demo mode)
+            from app.core.config import settings
+            if settings.GATEWAY_MODE in ("PRODUCTION", "RAZORPAY_TEST"):
+                gateway = RazorpayPaymentGateway()
+            else:
+                gateway = SimulatedPaymentGateway()
 
-            if action_type == "ESCALATE_TO_HUMAN":
-                res = {
-                    "execution_id": target_id,
-                    "action_id": target_id,
-                    "case_id": case_id or "demo-case",
-                    "event_id": event_id or "event-id",
-                    "action": action_type,
-                    "amount": amount,
-                    "currency": currency,
-                    "status": "SUCCESS",
-                    "recovered": False,
-                    "recovered_amount": Decimal("0.00"),
-                    "message": "Case escalated to human collections representative",
-                    "executed_at": datetime.now(timezone.utc).isoformat(),
-                }
-                EXECUTION_REGISTRY[target_id] = res
-                return res
-
-            # 4. Simulate execution based on ground truth outcomes
-            # Note: ground_truth is simulation/test metadata only. In production this data is fetched from payment provider.
-            # Genuinely prevent success-by-default execution. Missing outcome defaults to failure.
-            action_success = False
-            recovered_amount = Decimal("0.00")
-            message = (
-                "Recovery action failed: No ground truth simulation outcome provided."
+            # 3. Call the Gateway Abstraction layer
+            result = gateway.execute_action(
+                action_type=action_type,
+                amount=amount,
+                currency=currency,
+                case_id=case_id or "demo-case",
+                event_id=event_id or "event-id",
+                action_id=target_id,
+                ground_truth=ground_truth,
+                simulate_failure=simulate_failure,
             )
 
-            if ground_truth:
-                action_success = ground_truth.get("action_success", False)
-                if action_success:
-                    recovered_amount = Decimal(
-                        str(ground_truth.get("recovered_amount", amount))
-                    )
-                    message = f"Payment recovery successful via strategy: {action_type}"
-
-            # Generate unique execution_id for every actual execution attempt
-            attempt_execution_id = f"EXEC-{uuid.uuid4().hex[:12].upper()}"
-
             res = {
-                "execution_id": attempt_execution_id,
+                "execution_id": result.provider_reference,
                 "action_id": target_id,
                 "case_id": case_id or "demo-case",
                 "event_id": event_id or "event-id",
                 "action": action_type,
                 "amount": amount,
                 "currency": currency,
-                "status": "SUCCESS" if action_success else "FAILED",
-                "recovered": action_success,
-                "recovered_amount": recovered_amount,
-                "message": message,
+                "status": "SUCCESS" if result.success or action_type in ("DO_NOTHING", "ESCALATE_TO_HUMAN") else "FAILED",
+                "recovered": result.recovered,
+                "recovered_amount": result.recovered_amount,
+                "message": result.failure_reason or "Execution completed",
                 "executed_at": datetime.now(timezone.utc).isoformat(),
+                "async_reconciliation": result.async_reconciliation
             }
 
             # Persist execution result in canonical registry

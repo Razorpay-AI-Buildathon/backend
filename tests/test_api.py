@@ -460,6 +460,13 @@ class TestBackendRestAPI(unittest.TestCase):
         self.assertEqual(log["decision_source"], "API_SIMULATION")
         self.assertNotEqual(log["model"], "gpt-fake-model")
 
+        # Verify Execution record exists in database
+        from app.models.case import Execution
+        db_exec = db_session.query(Execution).filter(Execution.case_id == "case-test-19").first()
+        self.assertIsNotNone(db_exec)
+        self.assertEqual(float(db_exec.amount), 900.0)
+        self.assertEqual(db_exec.status, "SUCCESS")
+
     def test_20_execution_side_effects_on_rejection(self):
         # Rejected token execution must cause zero side-effects
         exec_payload = {
@@ -634,6 +641,216 @@ class TestBackendRestAPI(unittest.TestCase):
         bad_case_payload = dict(exec_payload, case_id="case-diff-23")
         resp4 = self.client.post("/api/execute", json=bad_case_payload, headers=self.headers)
         self.assertEqual(resp4.status_code, 409)
+
+    def test_20_payment_event_ingestion_and_idempotency(self):
+        payload = {
+            "event_id": "test-ingest-evt-001",
+            "merchant_id": "merch-ingest-test",
+            "customer_id": "cust-ingest-test",
+            "event_type": "FAILED_PAYMENT",
+            "amount": 2500.00,
+            "currency": "INR",
+            "failure_code": "bank_timeout",
+            "provider": "razorpay",
+            "provider_event_id": "prov-ref-ingest-001",
+            "metadata": {
+                "customer_email": "ingest@example.com"
+            }
+        }
+
+        # 1. First Ingestion
+        resp = self.client.post("/api/events/payment", json=payload, headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["message"], "Event ingested successfully")
+        self.assertEqual(data["event_id"], "test-ingest-evt-001")
+        case_id = data["case_id"]
+        self.assertTrue(case_id.startswith("case-"))
+
+        # 2. Duplicate Ingestion (Idempotent check by event_id)
+        resp2 = self.client.post("/api/events/payment", json=payload, headers=self.headers)
+        self.assertEqual(resp2.status_code, 200)
+        data2 = resp2.json()
+        self.assertEqual(data2["status"], "success")
+        self.assertEqual(data2["message"], "Event already processed (idempotent)")
+        self.assertEqual(data2["case_id"], case_id)
+
+        # 3. Duplicate Ingestion by provider_event_id (different event_id)
+        payload_dup_provider = dict(payload, event_id="test-ingest-evt-002")
+        resp3 = self.client.post("/api/events/payment", json=payload_dup_provider, headers=self.headers)
+        self.assertEqual(resp3.status_code, 200)
+        data3 = resp3.json()
+        self.assertEqual(data3["status"], "success")
+        self.assertEqual(data3["message"], "Event already processed (idempotent)")
+        self.assertEqual(data3["case_id"], case_id)
+
+    def test_21_case_state_transitions_audit_trail(self):
+        # 1. Ingest event to create case (starts at IDENTIFIED)
+        payload = {
+            "event_id": "test-tr-evt-001",
+            "merchant_id": "merch-tr-test",
+            "customer_id": "cust-tr-test",
+            "event_type": "FAILED_PAYMENT",
+            "amount": 1200.00,
+            "currency": "INR",
+            "failure_code": "bank_timeout",
+            "provider": "razorpay",
+            "provider_event_id": "prov-ref-tr-001",
+            "metadata": {}
+        }
+        resp = self.client.post("/api/events/payment", json=payload, headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        case_id = resp.json()["case_id"]
+
+        # Check DB to verify status is IDENTIFIED
+        db_session = next(get_db())
+        c = db_session.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+        self.assertEqual(c.status, CaseStatus.IDENTIFIED)
+
+        # Transition IDENTIFIED -> ANALYZING -> ACTION_PROPOSED
+        CaseStateMachine.transition_status(db_session, c, CaseStatus.ANALYZING, "analyze", "SYSTEM")
+        CaseStateMachine.transition_status(db_session, c, CaseStatus.ACTION_PROPOSED, "propose", "SYSTEM")
+        db_session.commit()
+
+        # 2. Evaluate action (should walk ACTION_PROPOSED -> GUARD_REVIEW -> APPROVED)
+        payload_eval = {
+            "action_type": "RETRY_PAYMENT",
+            "amount": 1200.00,
+            "currency": "INR",
+            "current_attempts": 0,
+            "max_retries": 3,
+            "case_id": case_id,
+            "event_id": "test-tr-evt-001",
+            "action_id": "action-tr-001"
+        }
+        resp_eval = self.client.post("/api/action-guard/evaluate", json=payload_eval, headers=self.headers)
+        self.assertEqual(resp_eval.status_code, 200)
+        token = resp_eval.json()["authorization_token"]
+
+        # Refresh from DB and verify transitions occurred
+        db_session.refresh(c)
+        self.assertEqual(c.status, CaseStatus.APPROVED)
+        
+        # Verify transition logs exist in audit trail
+        transitions = [log for log in c.audit_log if log.get("event") == "state_transition"]
+        self.assertTrue(len(transitions) >= 4)
+        self.assertEqual(transitions[0]["inputs"]["new_status"], "ANALYZING")
+        self.assertEqual(transitions[1]["inputs"]["new_status"], "ACTION_PROPOSED")
+        self.assertEqual(transitions[2]["inputs"]["new_status"], "GUARD_REVIEW")
+        self.assertEqual(transitions[3]["inputs"]["new_status"], "APPROVED")
+
+        # 3. Execute recovery (should walk APPROVED -> EXECUTING -> RECOVERED)
+        exec_payload = {
+            "action_type": "RETRY_PAYMENT",
+            "amount": 1200.00,
+            "currency": "INR",
+            "authorization_token": token,
+            "guard_approved": True,
+            "case_id": case_id,
+            "event_id": "test-tr-evt-001",
+            "action_id": "action-tr-001",
+            "ground_truth": {
+                "action_success": True
+            }
+        }
+        resp_exec = self.client.post("/api/execute", json=exec_payload, headers=self.headers)
+        self.assertEqual(resp_exec.status_code, 200)
+
+        # Refresh from DB and verify final status and transitions
+        db_session.refresh(c)
+        self.assertEqual(c.status, CaseStatus.RECOVERED)
+        
+        transitions = [log for log in c.audit_log if log.get("event") == "state_transition"]
+        self.assertTrue(len(transitions) >= 6)
+        self.assertEqual(transitions[4]["inputs"]["new_status"], "EXECUTING")
+        self.assertEqual(transitions[5]["inputs"]["new_status"], "RECOVERED")
+
+    def test_22_retry_and_replanning_loop(self):
+        # 1. Ingest event to create case (attempts = 0, max = 3)
+        payload = {
+            "event_id": "test-loop-evt-001",
+            "merchant_id": "merch-loop",
+            "customer_id": "cust-loop",
+            "event_type": "FAILED_PAYMENT",
+            "amount": 800.00,
+            "currency": "INR",
+            "failure_code": "bank_timeout",
+            "provider": "razorpay",
+            "provider_event_id": "prov-ref-loop-001",
+            "metadata": {}
+        }
+        resp = self.client.post("/api/events/payment", json=payload, headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        case_id = resp.json()["case_id"]
+
+        db_session = next(get_db())
+        c = db_session.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+        self.assertEqual(c.status, CaseStatus.IDENTIFIED)
+        self.assertEqual(c.current_recovery_attempt, 0)
+        self.assertEqual(c.max_attempts, 3)
+
+        # Helper to simulate an evaluate and failed execution cycle
+        def run_failed_attempt(action_id: str, current_attempts: int):
+            # Transition IDENTIFIED or ANALYZING -> ACTION_PROPOSED
+            if c.status == CaseStatus.IDENTIFIED or c.status == CaseStatus.ANALYZING:
+                if c.status == CaseStatus.IDENTIFIED:
+                    CaseStateMachine.transition_status(db_session, c, CaseStatus.ANALYZING, "analyze", "SYSTEM")
+                CaseStateMachine.transition_status(db_session, c, CaseStatus.ACTION_PROPOSED, "propose", "SYSTEM")
+                db_session.commit()
+
+            payload_eval = {
+                "action_type": "RETRY_PAYMENT",
+                "amount": 800.00,
+                "currency": "INR",
+                "current_attempts": current_attempts,
+                "max_retries": 3,
+                "case_id": case_id,
+                "event_id": "test-loop-evt-001",
+                "action_id": action_id
+            }
+            resp_eval = self.client.post("/api/action-guard/evaluate", json=payload_eval, headers=self.headers)
+            self.assertEqual(resp_eval.status_code, 200)
+            token = resp_eval.json()["authorization_token"]
+
+            exec_payload = {
+                "action_type": "RETRY_PAYMENT",
+                "amount": 800.00,
+                "currency": "INR",
+                "authorization_token": token,
+                "guard_approved": True,
+                "case_id": case_id,
+                "event_id": "test-loop-evt-001",
+                "action_id": action_id,
+                "ground_truth": {
+                    "action_success": False  # Force failure outcome
+                }
+            }
+            resp_exec = self.client.post("/api/execute", json=exec_payload, headers=self.headers)
+            self.assertEqual(resp_exec.status_code, 200)
+
+        # Attempt 1 -> fails -> transitions back to ANALYZING
+        run_failed_attempt("act-l-1", 0)
+        db_session.refresh(c)
+        self.assertEqual(c.status, CaseStatus.ANALYZING)
+        self.assertEqual(c.current_recovery_attempt, 1)
+        self.assertIsNotNone(c.next_action_at)
+
+        # Attempt 2 -> fails -> transitions back to ANALYZING
+        run_failed_attempt("act-l-2", 1)
+        db_session.refresh(c)
+        self.assertEqual(c.status, CaseStatus.ANALYZING)
+        self.assertEqual(c.current_recovery_attempt, 2)
+
+        # Attempt 3 -> fails -> transitions to CLOSED (since attempt count reaches max 3)
+        run_failed_attempt("act-l-3", 2)
+        db_session.refresh(c)
+        self.assertEqual(c.status, CaseStatus.CLOSED)
+        self.assertEqual(c.current_recovery_attempt, 3)
+        self.assertIsNotNone(c.closed_at)
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

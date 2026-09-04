@@ -171,6 +171,7 @@ class CaseDetail(BaseModel):
     audit_log: List[Any]
     created_at: datetime
     actions: List[Dict[str, Any]] = []
+    audit_events: Optional[List[Dict[str, Any]]] = []
 
     class Config:
         from_attributes = True
@@ -186,3 +187,68 @@ class MetricsResponse(BaseModel):
     human_escalation_rate: float
     backend_action_agreement: Optional[float] = None
     council_action_agreement: Optional[float] = None
+
+    # Task 17 Evaluation & BI Metrics
+    # Financial
+    recovered_value_per_attempt: float = 0.0
+    # Operational
+    avg_attempts: float = 0.0
+    avg_recovery_time_seconds: float = 0.0
+    execution_failure_rate: float = 0.0
+    # AI
+    council_confidence: float = 0.0
+    proposal_acceptance_rate: float = 0.0
+    replan_rate: float = 0.0
+    guard_override_rate: float = 0.0
+    # Strategy mappings
+    recovery_by_action_type: Dict[str, float] = {}
+    recovery_by_failure_code: Dict[str, float] = {}
+    recovery_by_customer_risk_band: Dict[str, float] = {}
+    recovery_by_amount_band: Dict[str, float] = {}
+    recovery_by_merchant: Dict[str, float] = {}
+
+    # Task 36 Reconciled metrics
+    reconciled_revenue_recovered: float = 0.0
+    reconciled_recovery_rate: float = 0.0
+
+    # Task 37 A/B Experiment metrics
+    control_recovery_rate: float = 0.0
+    treatment_recovery_rate: float = 0.0
+    control_revenue_recovered: float = 0.0
+    treatment_revenue_recovered: float = 0.0
+
+
+class HumanReviewRequest(BaseModel):
+    action: str
+    operator_id: str
+    notes: Optional[str] = None
+    simulate_failure: Optional[bool] = False
+
+
+class MerchantPolicyCreate(BaseModel):
+    merchant_id: str
+    max_attempts: int
+    retry_backoff: int
+    amount_threshold: float
+    allowed_actions: List[str] = []
+    human_review_threshold: float = 70.0
+    risk_threshold: float = 80.0
+    cooldown: int = 3600
+    enabled: bool = True
+
+
+class MerchantPolicyResponse(BaseModel):
+    id: str
+    merchant_id: str
+    max_attempts: int
+    retry_backoff: int
+    amount_threshold: float
+    allowed_actions: List[str]
+    human_review_threshold: float
+    risk_threshold: float
+    cooldown: int
+    enabled: bool
+    version: int
+
+    class Config:
+        from_attributes = True

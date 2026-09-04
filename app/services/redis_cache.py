@@ -5,7 +5,8 @@ from typing import Optional
 
 logger = logging.getLogger("recoverai.cache")
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+from app.core.config import settings
+REDIS_URL = settings.REDIS_URL
 
 class RedisCache:
     _client = None
@@ -70,3 +71,38 @@ class RedisCache:
         except Exception as e:
             logger.error(f"Redis clear pattern {pattern} failed: {e}")
             return False
+
+
+class RedisLock:
+    def __init__(self, lock_key: str, expire_seconds: int = 10):
+        import uuid
+        self.lock_key = f"lock:{lock_key}"
+        self.expire_seconds = expire_seconds
+        self.client = RedisCache.get_client()
+        self.token = str(uuid.uuid4())
+
+    def __enter__(self) -> bool:
+        if not self.client:
+            return True # Fail open if Redis is down
+        try:
+            acquired = self.client.set(self.lock_key, self.token, nx=True, ex=self.expire_seconds)
+            return bool(acquired)
+        except Exception as e:
+            print(f"RedisLock acquire error: {e}")
+            return True # Fail open on Redis connectivity issues
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.client:
+            return
+        # Lua script to release lock atomically only if token matches
+        lua_release = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        """
+        try:
+            self.client.eval(lua_release, 1, self.lock_key, self.token)
+        except Exception as e:
+            print(f"RedisLock release error: {e}")
