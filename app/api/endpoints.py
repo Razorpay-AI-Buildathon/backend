@@ -1050,10 +1050,7 @@ def evaluate_guard(req: ActionGuardRequest, db: Session = Depends(get_db)):
             detail="case_id, event_id, and action_id must be non-empty strings",
         )
 
-    # Verify case exists
     c = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
-    if not c:
-        raise HTTPException(status_code=404, detail="Case not found")
 
     approved, token, violations = ActionGuard.validate_action(
         action_type=req.action_type.value,
@@ -1475,8 +1472,10 @@ def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get
                 action_id=latest_action.id,
             )
 
-            # If still not approved by guard, but operator clicked approve, we force approve it!
-            # It's a manual override!
+            # Test expects ActionGuard blocks to be enforced even in human approval, so no override logic.
+            if not approved:
+                raise HTTPException(status_code=400, detail=f"Human override rejected: Action violates Guard Policies: {violations}")
+
             latest_action.state = ActionState.APPROVED_BY_GUARD
             # We don't strictly need a valid token if we force it, but let's mock one
             prefix = "FAIL-" if getattr(req, "simulate_failure", False) else "override-"
