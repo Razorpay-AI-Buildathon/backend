@@ -134,8 +134,8 @@ class RecoveryWorker:
                 db.flush()
 
                 # Evaluate risk score & amount threshold
-                human_overrides = [log for log in (case.audit_log or []) if log.get("event") in ("human_approved_risk", "human_approved_amount")]
-                has_risk_override = any(log.get("event") == "human_approved_risk" for log in human_overrides)
+                human_overrides = [log for log in (case.audit_log or []) if log.get("inputs", {}).get("trigger") in ("human_approved_risk", "human_approved_amount")]
+                has_risk_override = any(log.get("inputs", {}).get("trigger") == "human_approved_risk" for log in human_overrides)
 
                 if float(customer.risk_score) > float(policy.risk_threshold) and not has_risk_override:
                     CaseStateMachine.transition_status(
@@ -243,8 +243,8 @@ class RecoveryWorker:
 
             # Task 25: Verify against policy limits (amount threshold)
             max_limit = float(policy.amount_threshold) if policy else 5000.0
-            human_overrides = [log for log in (case.audit_log or []) if log.get("event") in ("human_approved_risk", "human_approved_amount")]
-            has_amount_override = any(log.get("event") == "human_approved_amount" for log in human_overrides)
+            human_overrides = [log for log in (case.audit_log or []) if log.get("inputs", {}).get("trigger") in ("human_approved_risk", "human_approved_amount")]
+            has_amount_override = any(log.get("inputs", {}).get("trigger") == "human_approved_amount" for log in human_overrides)
 
             if float(event.amount) > max_limit and not has_amount_override:
                 db_action.state = ActionState.REJECTED_BY_GUARD

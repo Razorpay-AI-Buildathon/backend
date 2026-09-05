@@ -7,6 +7,11 @@ class SSEManager:
         self.loop = None
         
     def register(self, queue: asyncio.Queue):
+        if not self.loop:
+            try:
+                self.loop = asyncio.get_event_loop()
+            except RuntimeError:
+                pass
         self.connections.add(queue)
         
     def unregister(self, queue: asyncio.Queue):

@@ -415,7 +415,7 @@ def get_ready(db: Session = Depends(get_db)):
 
 
 @router.post("/api/events/payment", response_model=PaymentEventIngestResponse)
-def ingest_payment_event(payload: PaymentEventIngest, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key)):
+def ingest_payment_event(payload: PaymentEventIngest, db: Session = Depends(get_db), merchant_id: Optional[str] = Depends(verify_api_key_or_session)):
     if merchant_id:
         from app.services.rate_limiter import check_rate_limit
         check_rate_limit(f"ingest:{merchant_id}", limit=20, window_seconds=60)
@@ -904,7 +904,7 @@ def list_cases(
 
 
 @router.get("/api/cases/stream")
-async def sse_cases_stream():
+async def sse_cases_stream(merchant_id: Optional[str] = Depends(verify_api_key_or_session)):
     import asyncio
     from fastapi.responses import StreamingResponse
     from app.services.sse import sse_manager
@@ -1804,7 +1804,7 @@ def list_audit_events(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    merchant_id: Optional[str] = Depends(verify_api_key),
+    merchant_id: Optional[str] = Depends(resolve_optional_api_key),
 ):
     """Global audit log with filtering by event_type, decision_source, case_id, actor."""
     from app.models.case import AuditEvent
@@ -1844,7 +1844,7 @@ def list_audit_events(
 @router.get("/api/analytics/strategies")
 def strategy_analytics(
     db: Session = Depends(get_db),
-    merchant_id: Optional[str] = Depends(verify_api_key),
+    merchant_id: Optional[str] = Depends(resolve_optional_api_key),
 ):
     """Aggregate strategy performance metrics from recovery actions."""
     from sqlalchemy import func
