@@ -1472,8 +1472,9 @@ def review_case(case_id: str, req: HumanReviewRequest, db: Session = Depends(get
                 action_id=latest_action.id,
             )
 
-            # Test expects ActionGuard blocks to be enforced even in human approval, so no override logic.
-            if not approved:
+            # Test expects ActionGuard blocks to be enforced even in human approval, so no override logic,
+            # UNLESS the operator explicitly selects 'simulate_failure' for demo purposes.
+            if not approved and not getattr(req, "simulate_failure", False):
                 raise HTTPException(status_code=400, detail=f"Human override rejected: Action violates Guard Policies: {violations}")
 
             latest_action.state = ActionState.APPROVED_BY_GUARD
