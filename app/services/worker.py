@@ -109,7 +109,7 @@ class RecoveryWorker:
             from app.models.case import Execution
             active_execution = db.query(Execution).filter(
                 Execution.case_id == case_id,
-                Execution.status.in_(["SUCCESS", "PENDING"])
+                Execution.status == "PENDING"
             ).first()
             if active_execution:
                 print(f"RecoveryWorker: Active execution found for case {case_id}. Aborting evaluation.")
